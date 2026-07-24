@@ -40,6 +40,11 @@ class UploadResponse(BaseModel):
     project_root: str
 
 
+class CloneRequest(BaseModel):
+    repo_url: str = Field(description="Public GitHub repository URL")
+    branch: str | None = Field(default=None, description="Optional branch name")
+
+
 class AnalyzeResponse(BaseModel):
     session_id: str
     stats: ProjectStats
@@ -47,9 +52,12 @@ class AnalyzeResponse(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    scope: str = Field(description="'class' or 'project'")
+    scope: str = Field(description="'class', 'classes', or 'project'")
     class_path: str | None = Field(
         default=None, description="Relative path to .java file when scope=class"
+    )
+    class_paths: list[str] | None = Field(
+        default=None, description="Relative paths when scope=classes"
     )
 
 
@@ -63,7 +71,7 @@ class GenerationResult(BaseModel):
     initial_coverage_pct: float = 0.0
     final_coverage_pct: float = 0.0
     coverage_delta: float = 0.0
-    status: str = "no_change"  # "full_coverage", "partial_coverage", "failed_to_compile", "no_change"
+    status: str = "no_change"
 
 
 class GenerationBreakdown(BaseModel):
@@ -82,3 +90,25 @@ class GenerateResponse(BaseModel):
     stats: ProjectStats
     maven_output_tail: str = ""
 
+
+class GenerateJobStartResponse(BaseModel):
+    job_id: str
+    session_id: str
+    scope: str
+    message: str = ""
+
+
+class GenerateJobStatus(BaseModel):
+    job_id: str
+    session_id: str
+    scope: str
+    status: str
+    current_index: int = 0
+    total: int = 0
+    current_class: str = ""
+    message: str = ""
+    results: list[GenerationResult] = Field(default_factory=list)
+    breakdown: GenerationBreakdown | None = None
+    stats: ProjectStats | None = None
+    maven_output_tail: str = ""
+    error: str | None = None

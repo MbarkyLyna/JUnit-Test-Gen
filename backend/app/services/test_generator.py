@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import re
+import asyncio
+import os
+from collections.abc import Callable
 from pathlib import Path
 
 from app.models.schemas import (
     CoverageStats,
     GenerationBreakdown,
     GenerationResult,
-    GenerateResponse,
     ProjectStats,
 )
 from app.services import di_resolver, jacoco, java_parser, ollama_client
 from app.services.java_parser import compute_static_stats
+
+COOLDOWN_SECONDS = float(os.environ.get("GENERATION_COOLDOWN_SECONDS", "3"))
 
 
 def _test_path_for_class(class_path: Path, project_root: Path) -> Path:
@@ -31,6 +34,8 @@ def _test_path_for_class(class_path: Path, project_root: Path) -> Path:
 
 
 def _infer_test_package(test_content: str) -> str | None:
+    import re
+
     m = re.search(r"^\s*package\s+([\w.]+)\s*;", test_content, re.MULTILINE)
     return m.group(1) if m else None
 
@@ -54,6 +59,15 @@ def _rel_path(path: Path, project_root: Path) -> str:
     return str(path.relative_to(project_root)).replace("\\", "/")
 
 
+def _resolve_class_path(project_root: Path, class_path_str: str) -> Path:
+    target = project_root / class_path_str.replace("/", "\\")
+    if not target.exists():
+        target = project_root / class_path_str
+    if not target.exists():
+        raise FileNotFoundError(f"Class not found: {class_path_str}")
+    return target
+
+
 async def generate_for_class(
     class_path: Path,
     project_root: Path,
@@ -72,7 +86,6 @@ async def generate_for_class(
         target_source = java_parser.read_class_content(class_path)
         dependencies = di_resolver.resolve_dependencies(class_path, project_root)
 
-        # Exclude Lombok/DTO boilerplate lines from target uncovered set
         trivial_lines = java_parser.identify_trivial_lines(target_source)
 
         uncovered: list[int] = []
@@ -178,54 +191,117 @@ def build_generation_breakdown(results: list[GenerationResult]) -> GenerationBre
     )
 
 
+async def _cooldown_between_classes() -> None:
+    if COOLDOWN_SECONDS > 0:
+        await asyncio.sleep(COOLDOWN_SECONDS)
+
+
+async def _process_class_batch(
+    targets: list[Path],
+    project_root: Path,
+    coverage: CoverageStats | None,
+    model: str,
+    *,
+    skip_above_80: bool = False,
+    stop_at_project_80: bool = False,
+    on_progress: Callable[[int, int, str, str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
+) -> tuple[list[GenerationResult], CoverageStats | None]:
+    results: list[GenerationResult] = []
+    total = len(targets)
+
+    for idx, cls_path in enumerate(targets, start=1):
+        if should_abort and should_abort():
+            break
+
+        rel = _rel_path(cls_path, project_root)
+        cls_name = _class_name_from_path(cls_path)
+
+        if skip_above_80 and coverage and coverage.per_class.get(cls_name, 0.0) >= 80.0:
+            continue
+
+        if on_progress:
+            on_progress(idx, total, rel, f"Generating class {idx} of {total}: {cls_name}")
+
+        result = await generate_for_class(cls_path, project_root, coverage, model)
+        results.append(result)
+
+        report = jacoco.find_jacoco_report(project_root)
+        if report:
+            coverage = jacoco.parse_jacoco_report(report)
+
+        if stop_at_project_80 and coverage and coverage.line_coverage_pct >= 80.0:
+            break
+
+        if idx < total and not (should_abort and should_abort()):
+            await _cooldown_between_classes()
+
+    return results, coverage
+
+
 async def generate_tests_for_scope(
     project_root: Path,
     scope: str,
     class_path_str: str | None,
     coverage: CoverageStats | None,
     model: str = ollama_client.DEFAULT_MODEL,
+    class_paths: list[str] | None = None,
+    on_progress: Callable[[int, int, str, str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> tuple[list[GenerationResult], GenerationBreakdown, str]:
     results: list[GenerationResult] = []
 
     if scope == "class":
         if not class_path_str:
             raise ValueError("class_path required for scope=class")
-        target = project_root / class_path_str.replace("/", "\\")
-        if not target.exists():
-            target = project_root / class_path_str
-        if not target.exists():
-            raise FileNotFoundError(f"Class not found: {class_path_str}")
-
+        target = _resolve_class_path(project_root, class_path_str)
+        if on_progress:
+            on_progress(1, 1, _rel_path(target, project_root), f"Generating class 1 of 1")
         result = await generate_for_class(target, project_root, coverage, model)
         results.append(result)
         _, maven_tail = jacoco.run_maven_tests(project_root)
         breakdown = build_generation_breakdown(results)
         return results, breakdown, maven_tail[-3000:]
 
-    # Whole project: iterate main classes below 80% coverage
-    classes = java_parser.list_main_classes(project_root)
-    classes = _prioritize_classes(classes, coverage)
+    if scope == "classes":
+        paths = class_paths or ([class_path_str] if class_path_str else [])
+        if not paths:
+            raise ValueError("class_paths required for scope=classes")
 
-    for cls_path in classes:
-        cls_name = _class_name_from_path(cls_path)
-        if coverage and coverage.per_class.get(cls_name, 0.0) >= 80.0:
-            continue
+        targets = [_resolve_class_path(project_root, p) for p in paths]
+        results, _ = await _process_class_batch(
+            targets,
+            project_root,
+            coverage,
+            model,
+            on_progress=on_progress,
+            should_abort=should_abort,
+        )
+        _, maven_tail = jacoco.run_maven_tests(project_root)
+        breakdown = build_generation_breakdown(results)
+        return results, breakdown, maven_tail[-3000:]
 
-        result = await generate_for_class(cls_path, project_root, coverage, model)
-        results.append(result)
+    if scope == "project":
+        classes = java_parser.list_main_classes(project_root)
+        classes = _prioritize_classes(classes, coverage)
+        if on_progress and classes:
+            on_progress(0, len(classes), "", f"Preparing project generation for {len(classes)} class(es)")
 
-        # Refresh coverage after each generation for better prioritization
-        report = jacoco.find_jacoco_report(project_root)
-        if report:
-            coverage = jacoco.parse_jacoco_report(report)
+        results, _ = await _process_class_batch(
+            classes,
+            project_root,
+            coverage,
+            model,
+            skip_above_80=True,
+            stop_at_project_80=True,
+            on_progress=on_progress,
+            should_abort=should_abort,
+        )
+        _, maven_tail = jacoco.run_maven_tests(project_root)
+        breakdown = build_generation_breakdown(results)
+        return results, breakdown, maven_tail[-3000:]
 
-        if coverage and coverage.line_coverage_pct >= 80.0:
-            break
-
-    _, maven_tail = jacoco.run_maven_tests(project_root)
-    breakdown = build_generation_breakdown(results)
-    return results, breakdown, maven_tail[-3000:]
-
+    raise ValueError(f"Unknown scope: {scope}")
 
 
 async def build_project_stats(project_root: Path, analyzed: bool) -> ProjectStats:

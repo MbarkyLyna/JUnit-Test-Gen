@@ -1,6 +1,10 @@
-export default function StatsPanel({ stats, analyzed, ollamaOk, breakdown }) {
+export default function StatsPanel({ stats, analyzed, health, breakdown }) {
   const staticStats = stats?.static || {};
   const coverage = stats?.coverage;
+  const ollamaOk = health?.ollama_available;
+  const model = health?.model || 'qwen2.5-coder:1.5b';
+  const ramOk = health?.ram_ok !== false;
+  const availRam = health?.available_ram_gb;
 
   return (
     <div className="stats-panel panel">
@@ -58,10 +62,17 @@ export default function StatsPanel({ stats, analyzed, ollamaOk, breakdown }) {
           <span className="coverage-target">Target: 80%</span>
         </div>
       )}
-      <div className={`status-badge ${ollamaOk ? 'ok' : 'warn'}`}>
-        Ollama: {ollamaOk ? 'Connected (phi4-mini)' : 'Not available (localhost:11434)'}
+
+      <div className="status-badges">
+        <div className={`status-badge ${ollamaOk ? 'ok' : 'warn'}`}>
+          Ollama: {ollamaOk ? `Connected (${model})` : 'Not available (localhost:11434)'}
+        </div>
+        <div className={`status-badge ${ramOk ? 'ok' : 'warn'}`}>
+          RAM: {ramOk
+            ? `${availRam ?? '?'} GB free — OK for batch generation`
+            : (health?.ram_message || 'Low memory — batch generation blocked')}
+        </div>
       </div>
     </div>
   );
 }
-

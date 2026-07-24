@@ -2,27 +2,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 
 from app.models.schemas import (
     AnalyzeResponse,
+    CloneRequest,
+    GenerateJobStartResponse,
+    GenerateJobStatus,
     GenerateRequest,
     GenerateResponse,
     ProjectStats,
     UploadResponse,
 )
-from app.services import jacoco, test_generator
+from app.services import generation_jobs, jacoco, test_generator
+from app.services.generation_jobs import abort_job, create_job, get_job, job_to_dict, run_generation_job
 from app.services.java_parser import compute_static_stats
+from app.services.ollama_client import DEFAULT_MODEL
+from app.services.resource_guard import check_host_memory
 from app.services.workspace import (
     build_file_tree,
+    clone_github_repo,
     create_session,
     extract_zip,
-    get_session_path,
 )
 
 router = APIRouter(prefix="/api")
 
-# In-memory session metadata
 _session_meta: dict[str, dict] = {}
 
 
@@ -31,6 +36,56 @@ def _get_project_root(session_id: str) -> Path:
     if not meta:
         raise HTTPException(status_code=404, detail="Session not found")
     return Path(meta["project_root"])
+
+
+def _build_upload_response(session_id: str, project_root: Path) -> UploadResponse:
+    static = compute_static_stats(project_root)
+    stats = ProjectStats(static=static, coverage=None, analyzed=False)
+    tree = build_file_tree(project_root)
+    return UploadResponse(
+        session_id=session_id,
+        tree=tree,
+        stats=stats,
+        project_root=str(project_root),
+    )
+
+
+async def _ensure_coverage(session_id: str, project_root: Path):
+    meta = _session_meta[session_id]
+    coverage = None
+    if meta.get("analyzed"):
+        report = jacoco.find_jacoco_report(project_root)
+        if report:
+            coverage = jacoco.parse_jacoco_report(report)
+    else:
+        pom = project_root / "pom.xml"
+        if pom.exists():
+            jacoco.inject_jacoco_plugin(pom)
+            jacoco.run_maven_tests(project_root)
+            report = jacoco.find_jacoco_report(project_root)
+            if report:
+                coverage = jacoco.parse_jacoco_report(report)
+            meta["analyzed"] = True
+    return coverage
+
+
+def _validate_generate_scope(body: GenerateRequest) -> None:
+    if body.scope not in {"class", "classes", "project"}:
+        raise HTTPException(
+            status_code=400,
+            detail="scope must be 'class', 'classes', or 'project'",
+        )
+    if body.scope == "class" and not body.class_path:
+        raise HTTPException(status_code=400, detail="class_path required for class scope")
+    if body.scope == "classes" and not body.class_paths:
+        raise HTTPException(status_code=400, detail="class_paths required for classes scope")
+
+
+def _require_ram_for_batch(scope: str) -> None:
+    if scope in {"classes", "project"}:
+        ok, msg, _ = check_host_memory()
+        if not ok:
+            raise HTTPException(status_code=503, detail=msg)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -47,16 +102,23 @@ async def upload_project(file: UploadFile = File(...)) -> UploadResponse:
         "analyzed": False,
     }
 
-    static = compute_static_stats(project_root)
-    stats = ProjectStats(static=static, coverage=None, analyzed=False)
-    tree = build_file_tree(project_root)
+    return _build_upload_response(session_id, project_root)
 
-    return UploadResponse(
-        session_id=session_id,
-        tree=tree,
-        stats=stats,
-        project_root=str(project_root),
-    )
+
+@router.post("/clone", response_model=UploadResponse)
+async def clone_project(body: CloneRequest) -> UploadResponse:
+    session_id = create_session()
+    try:
+        project_root = clone_github_repo(session_id, body.repo_url, body.branch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    _session_meta[session_id] = {
+        "project_root": str(project_root),
+        "analyzed": False,
+    }
+
+    return _build_upload_response(session_id, project_root)
 
 
 @router.post("/analyze/{session_id}", response_model=AnalyzeResponse)
@@ -95,33 +157,19 @@ async def generate_tests(session_id: str, body: GenerateRequest) -> GenerateResp
     if session_id not in _session_meta:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    _validate_generate_scope(body)
+    _require_ram_for_batch(body.scope)
+
     meta = _session_meta[session_id]
     project_root = Path(meta["project_root"])
-
-    if body.scope not in {"class", "project"}:
-        raise HTTPException(status_code=400, detail="scope must be 'class' or 'project'")
-
-    if body.scope == "class" and not body.class_path:
-        raise HTTPException(status_code=400, detail="class_path required for class scope")
-
-    # Ensure analyzed for coverage data
-    coverage = None
-    if meta.get("analyzed"):
-        report = jacoco.find_jacoco_report(project_root)
-        if report:
-            coverage = jacoco.parse_jacoco_report(report)
-    else:
-        pom = project_root / "pom.xml"
-        if pom.exists():
-            jacoco.inject_jacoco_plugin(pom)
-            jacoco.run_maven_tests(project_root)
-            report = jacoco.find_jacoco_report(project_root)
-            if report:
-                coverage = jacoco.parse_jacoco_report(report)
-            meta["analyzed"] = True
+    coverage = await _ensure_coverage(session_id, project_root)
 
     results, breakdown, maven_tail = await test_generator.generate_tests_for_scope(
-        project_root, body.scope, body.class_path, coverage
+        project_root,
+        body.scope,
+        body.class_path,
+        coverage,
+        class_paths=body.class_paths,
     )
 
     stats = await test_generator.build_project_stats(project_root, analyzed=True)
@@ -135,9 +183,84 @@ async def generate_tests(session_id: str, body: GenerateRequest) -> GenerateResp
     )
 
 
+@router.post("/generate/{session_id}/start", response_model=GenerateJobStartResponse)
+async def start_generate_job(
+    session_id: str,
+    body: GenerateRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateJobStartResponse:
+    if session_id not in _session_meta:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    _validate_generate_scope(body)
+
+    if body.scope == "class":
+        raise HTTPException(
+            status_code=400,
+            detail="Use POST /api/generate/{session_id} for single-class generation",
+        )
+
+    _require_ram_for_batch(body.scope)
+
+    meta = _session_meta[session_id]
+    project_root = Path(meta["project_root"])
+    coverage = await _ensure_coverage(session_id, project_root)
+
+    job = create_job(session_id, body.scope)
+    if body.scope == "classes":
+        job.total = len(body.class_paths or [])
+    elif body.scope == "project":
+        from app.services import java_parser
+
+        job.total = len(java_parser.list_main_classes(project_root))
+    job.message = "Job queued"
+
+    background_tasks.add_task(
+        run_generation_job,
+        job,
+        project_root,
+        body.scope,
+        body.class_path,
+        body.class_paths,
+        coverage,
+        DEFAULT_MODEL,
+    )
+
+    return GenerateJobStartResponse(
+        job_id=job.job_id,
+        session_id=session_id,
+        scope=body.scope,
+        message="Generation job started",
+    )
+
+
+@router.get("/generate/jobs/{job_id}", response_model=GenerateJobStatus)
+async def get_generate_job(job_id: str) -> GenerateJobStatus:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    data = job_to_dict(job)
+    return GenerateJobStatus(**data)
+
+
+@router.post("/generate/jobs/{job_id}/abort")
+async def abort_generate_job(job_id: str) -> dict:
+    if not abort_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found or already finished")
+    return {"job_id": job_id, "status": "abort_requested"}
+
+
 @router.get("/health")
 async def health() -> dict:
     from app.services.ollama_client import check_ollama_available
 
     ollama_ok = await check_ollama_available()
-    return {"status": "ok", "ollama_available": ollama_ok}
+    ram_ok, ram_msg, avail_gb = check_host_memory()
+    return {
+        "status": "ok",
+        "ollama_available": ollama_ok,
+        "model": DEFAULT_MODEL,
+        "ram_ok": ram_ok,
+        "ram_message": ram_msg,
+        "available_ram_gb": round(avail_gb, 2),
+    }

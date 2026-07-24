@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
 
 import httpx
 
-OLLAMA_BASE = "http://localhost:11434"
-DEFAULT_MODEL = "phi4-mini"
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
 
 
 async def check_ollama_available() -> bool:
