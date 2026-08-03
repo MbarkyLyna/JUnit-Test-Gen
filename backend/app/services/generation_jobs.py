@@ -106,6 +106,7 @@ async def run_generation_job(
             class_paths=class_paths,
             on_progress=on_progress,
             should_abort=should_abort,
+            session_id=job.session_id,
         )
         job.results = results
         job.breakdown = breakdown

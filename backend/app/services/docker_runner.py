@@ -85,6 +85,8 @@ def run_in_docker(
     project_root: Path,
     args: list[str] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
+    session_id: str | None = None,
+    activity_message: str = "Running Maven tests inside Docker container sandbox",
 ) -> tuple[int, str]:
     """
     Run Maven command strictly inside an isolated non-root Docker container sandbox.
@@ -92,6 +94,11 @@ def run_in_docker(
     Returns (exit_code, combined_output).
     Handles OOM kills (exit code 137) and timeouts with clear, explicit error messages.
     """
+    if session_id:
+        from app.services.session_tracker import end_activity, start_activity
+
+        start_activity(session_id, "docker_maven", activity_message)
+
     ensure_workspace_writable(project_root)
     args = args or ["test", "-DskipTests=false", "-q"]
     abs_path = project_root.resolve().as_posix()
@@ -142,3 +149,8 @@ def run_in_docker(
         return -1, "Docker executable ('docker') not found on system PATH. Docker is strictly required to execute untrusted code."
     except Exception as e:
         return -1, f"Docker daemon execution error: {str(e)}. Sandboxed execution aborted."
+    finally:
+        if session_id:
+            from app.services.session_tracker import end_activity
+
+            end_activity(session_id)

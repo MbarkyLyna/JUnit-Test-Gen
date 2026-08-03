@@ -63,8 +63,10 @@ class GenerateRequest(BaseModel):
 
 class GenerationResult(BaseModel):
     class_name: str = ""
+    class_fqcn: str = ""
     class_path: str
     test_path: str | None = None
+    test_source: str | None = None
     success: bool
     message: str
     tests_passed: bool = False
@@ -72,6 +74,14 @@ class GenerationResult(BaseModel):
     final_coverage_pct: float = 0.0
     coverage_delta: float = 0.0
     status: str = "no_change"
+
+
+class SessionStatusResponse(BaseModel):
+    session_id: str
+    active: bool
+    operation: str | None = None
+    message: str = ""
+    elapsed_seconds: int = 0
 
 
 class GenerationBreakdown(BaseModel):

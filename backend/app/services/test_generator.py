@@ -60,6 +60,17 @@ def _rel_path(path: Path, project_root: Path) -> str:
 
 
 def _resolve_class_path(project_root: Path, class_path_str: str) -> Path:
+    normalized = class_path_str.replace("\\", "/")
+    if (
+        "." in normalized
+        and "/" not in normalized
+        and not normalized.endswith(".java")
+    ):
+        fqcn_path = project_root / "src/main/java" / normalized.replace(".", "/")
+        fqcn_file = fqcn_path.with_suffix(".java")
+        if fqcn_file.exists():
+            return fqcn_file
+
     target = project_root / class_path_str.replace("/", "\\")
     if not target.exists():
         target = project_root / class_path_str
@@ -73,9 +84,11 @@ async def generate_for_class(
     project_root: Path,
     coverage: CoverageStats | None,
     model: str = ollama_client.DEFAULT_MODEL,
+    session_id: str | None = None,
 ) -> GenerationResult:
     rel = _rel_path(class_path, project_root)
     class_name = _class_name_from_path(class_path)
+    class_fqcn = java_parser.get_fqn(class_path, project_root)
     test_path = _test_path_for_class(class_path, project_root)
 
     initial_cov = 0.0
@@ -100,8 +113,13 @@ async def generate_for_class(
 
         pkg = java_parser.get_package_name(target_source)
         _write_test_file(test_path, test_code, pkg)
+        test_source = test_path.read_text(encoding="utf-8", errors="ignore")
 
-        exit_code, maven_out = jacoco.run_maven_tests(project_root)
+        exit_code, maven_out = jacoco.run_maven_tests(
+            project_root,
+            session_id=session_id,
+            activity_message="Running Maven tests for generated class",
+        )
         passed = exit_code == 0
 
         final_cov = initial_cov
@@ -126,8 +144,10 @@ async def generate_for_class(
 
         return GenerationResult(
             class_name=class_name,
+            class_fqcn=class_fqcn,
             class_path=rel,
             test_path=_rel_path(test_path, project_root),
+            test_source=test_source,
             success=True,
             message=msg,
             tests_passed=passed,
@@ -139,8 +159,10 @@ async def generate_for_class(
     except Exception as e:
         return GenerationResult(
             class_name=class_name,
+            class_fqcn=class_fqcn,
             class_path=rel,
             test_path=str(test_path.relative_to(project_root)) if test_path else None,
+            test_source=None,
             success=False,
             message=str(e),
             tests_passed=False,
@@ -206,6 +228,7 @@ async def _process_class_batch(
     stop_at_project_80: bool = False,
     on_progress: Callable[[int, int, str, str], None] | None = None,
     should_abort: Callable[[], bool] | None = None,
+    session_id: str | None = None,
 ) -> tuple[list[GenerationResult], CoverageStats | None]:
     results: list[GenerationResult] = []
     total = len(targets)
@@ -223,7 +246,9 @@ async def _process_class_batch(
         if on_progress:
             on_progress(idx, total, rel, f"Generating class {idx} of {total}: {cls_name}")
 
-        result = await generate_for_class(cls_path, project_root, coverage, model)
+        result = await generate_for_class(
+            cls_path, project_root, coverage, model, session_id=session_id
+        )
         results.append(result)
 
         report = jacoco.find_jacoco_report(project_root)
@@ -248,6 +273,7 @@ async def generate_tests_for_scope(
     class_paths: list[str] | None = None,
     on_progress: Callable[[int, int, str, str], None] | None = None,
     should_abort: Callable[[], bool] | None = None,
+    session_id: str | None = None,
 ) -> tuple[list[GenerationResult], GenerationBreakdown, str]:
     results: list[GenerationResult] = []
 
@@ -257,9 +283,15 @@ async def generate_tests_for_scope(
         target = _resolve_class_path(project_root, class_path_str)
         if on_progress:
             on_progress(1, 1, _rel_path(target, project_root), f"Generating class 1 of 1")
-        result = await generate_for_class(target, project_root, coverage, model)
+        result = await generate_for_class(
+            target, project_root, coverage, model, session_id=session_id
+        )
         results.append(result)
-        _, maven_tail = jacoco.run_maven_tests(project_root)
+        _, maven_tail = jacoco.run_maven_tests(
+            project_root,
+            session_id=session_id,
+            activity_message="Running final Maven verification",
+        )
         breakdown = build_generation_breakdown(results)
         return results, breakdown, maven_tail[-3000:]
 
@@ -276,8 +308,13 @@ async def generate_tests_for_scope(
             model,
             on_progress=on_progress,
             should_abort=should_abort,
+            session_id=session_id,
         )
-        _, maven_tail = jacoco.run_maven_tests(project_root)
+        _, maven_tail = jacoco.run_maven_tests(
+            project_root,
+            session_id=session_id,
+            activity_message="Running final Maven verification",
+        )
         breakdown = build_generation_breakdown(results)
         return results, breakdown, maven_tail[-3000:]
 
@@ -296,8 +333,13 @@ async def generate_tests_for_scope(
             stop_at_project_80=True,
             on_progress=on_progress,
             should_abort=should_abort,
+            session_id=session_id,
         )
-        _, maven_tail = jacoco.run_maven_tests(project_root)
+        _, maven_tail = jacoco.run_maven_tests(
+            project_root,
+            session_id=session_id,
+            activity_message="Running final Maven verification",
+        )
         breakdown = build_generation_breakdown(results)
         return results, breakdown, maven_tail[-3000:]
 

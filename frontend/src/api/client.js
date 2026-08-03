@@ -44,11 +44,20 @@ export async function generateTests(sessionId, scope, classPath = null, classPat
   return res.json();
 }
 
-export async function startGenerateJob(sessionId, scope, classPaths = null) {
+export async function getSessionStatus(sessionId) {
+  const res = await fetch(`${API_BASE}/status/${sessionId}`);
+  if (!res.ok) throw new Error(await parseError(res, 'Failed to fetch session status'));
+  return res.json();
+}
+
+export async function startGenerateJob(sessionId, scope, classPath = null, classPaths = null) {
+  const body = { scope };
+  if (classPath) body.class_path = classPath;
+  if (classPaths) body.class_paths = classPaths;
   const res = await fetch(`${API_BASE}/generate/${sessionId}/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scope, class_paths: classPaths }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await parseError(res, 'Failed to start generation job'));
   return res.json();

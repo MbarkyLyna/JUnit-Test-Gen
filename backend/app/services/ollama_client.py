@@ -6,7 +6,9 @@ import re
 import httpx
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "phi4-mini")
+
+
 
 
 async def check_ollama_available() -> bool:
@@ -173,7 +175,7 @@ async def generate_tests(
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 4096},
+                "options": {"temperature": 0.05, "num_predict": 4096},
             },
         )
         resp.raise_for_status()
@@ -206,4 +208,3 @@ async def generate_tests(
 
         # Fallback: Raise explicit ValueError so backend handles it as an explicit parsing error, never writing a silent broken/empty file
         raise ValueError(f"LLM Output Parsing Failed: Model output could not be parsed into a valid JUnit test class. Details: {reason}")
-

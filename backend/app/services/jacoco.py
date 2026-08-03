@@ -30,50 +30,122 @@ JACOCO_PLUGIN_SNIPPET = """
             </plugin>
 """
 
+JACOCO_REPORT_EXECUTION = """
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>"""
+
+JACOCO_REPORT_RELATIVE = Path("target/site/jacoco/jacoco.xml")
+
 
 def has_jacoco_plugin(pom_path: Path) -> bool:
     content = pom_path.read_text(encoding="utf-8", errors="ignore")
     return "jacoco-maven-plugin" in content
 
 
-def inject_jacoco_plugin(pom_path: Path) -> bool:
-    """Inject JaCoCo plugin into pom.xml if missing. Returns True if modified."""
-    if has_jacoco_plugin(pom_path):
+def has_jacoco_report_execution(pom_path: Path) -> bool:
+    content = pom_path.read_text(encoding="utf-8", errors="ignore")
+    return "<goal>report</goal>" in content
+
+
+def ensure_jacoco_report_execution(pom_path: Path) -> bool:
+    """Add report execution to an existing JaCoCo plugin block when missing."""
+    content = pom_path.read_text(encoding="utf-8", errors="ignore")
+    if has_jacoco_report_execution(pom_path) or not has_jacoco_plugin(pom_path):
         return False
 
-    content = pom_path.read_text(encoding="utf-8", errors="ignore")
+    marker = "<artifactId>jacoco-maven-plugin</artifactId>"
+    idx = content.find(marker)
+    if idx == -1:
+        return False
 
-    if "<plugins>" in content:
-        content = content.replace("<plugins>", f"<plugins>{JACOCO_PLUGIN_SNIPPET}", 1)
-    elif "</build>" in content:
-        content = content.replace(
-            "</build>",
-            f"        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>",
+    plugin_start = content.rfind("<plugin>", 0, idx)
+    plugin_end = content.find("</plugin>", idx)
+    if plugin_start == -1 or plugin_end == -1:
+        return False
+
+    plugin_block = content[plugin_start:plugin_end]
+    if "<executions>" in plugin_block:
+        new_plugin = plugin_block.replace(
+            "</executions>",
+            f"{JACOCO_REPORT_EXECUTION}\n                </executions>",
             1,
         )
     else:
-        content = content.replace(
-            "</project>",
-            f"    <build>\n        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>\n</project>",
-            1,
+        new_plugin = (
+            plugin_block
+            + f"""
+                <executions>{JACOCO_REPORT_EXECUTION}
+                </executions>"""
         )
 
-    pom_path.write_text(content, encoding="utf-8")
+    pom_path.write_text(content[:plugin_start] + new_plugin + content[plugin_end:], encoding="utf-8")
     return True
 
 
-def run_maven_tests(project_root: Path, timeout: int = 600) -> tuple[int, str]:
-    """Run mvn test strictly inside a Docker container sandbox."""
-    return docker_runner.run_in_docker(project_root, args=["test", "-DskipTests=false", "-q"], timeout=timeout)
+def inject_jacoco_plugin(pom_path: Path) -> bool:
+    """Ensure JaCoCo plugin and report execution exist in pom.xml. Returns True if modified."""
+    modified = False
 
+    if not has_jacoco_plugin(pom_path):
+        content = pom_path.read_text(encoding="utf-8", errors="ignore")
+
+        if "<plugins>" in content:
+            content = content.replace("<plugins>", f"<plugins>{JACOCO_PLUGIN_SNIPPET}", 1)
+        elif "</build>" in content:
+            content = content.replace(
+                "</build>",
+                f"        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>",
+                1,
+            )
+        else:
+            content = content.replace(
+                "</project>",
+                f"    <build>\n        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>\n</project>",
+                1,
+            )
+
+        pom_path.write_text(content, encoding="utf-8")
+        modified = True
+
+    if ensure_jacoco_report_execution(pom_path):
+        modified = True
+
+    return modified
+
+
+def run_maven_tests(
+    project_root: Path,
+    timeout: int = 600,
+    session_id: str | None = None,
+    activity_message: str = "Running Maven tests inside Docker container sandbox",
+) -> tuple[int, str]:
+    """Run mvn test + jacoco:report strictly inside a Docker container sandbox."""
+    return docker_runner.run_in_docker(
+        project_root,
+        args=["test", "jacoco:report", "-DskipTests=false"],
+        timeout=timeout,
+        session_id=session_id,
+        activity_message=activity_message,
+    )
 
 
 def find_jacoco_report(project_root: Path) -> Path | None:
+    canonical = project_root / JACOCO_REPORT_RELATIVE
+    if canonical.is_file():
+        return canonical
+
+    for candidate in sorted(project_root.rglob("target/site/jacoco/jacoco.xml")):
+        return candidate
+
     candidates = list(project_root.rglob("jacoco.xml"))
-    # Prefer site/jacoco report
-    for c in candidates:
-        if "site" in c.parts and "jacoco" in c.parts:
-            return c
+    for candidate in candidates:
+        if "site" in candidate.parts and "jacoco" in candidate.parts:
+            return candidate
     return candidates[0] if candidates else None
 
 

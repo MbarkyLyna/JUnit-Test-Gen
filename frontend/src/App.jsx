@@ -4,16 +4,25 @@ import {
   analyzeProject,
   checkHealth,
   cloneProject,
-  generateTests,
   getGenerateJob,
+  getSessionStatus,
   startGenerateJob,
   uploadProject,
 } from './api/client';
 import FileTree from './components/FileTree';
+import GeneratedTestPanel from './components/GeneratedTestPanel';
 import StatsPanel from './components/StatsPanel';
 import UploadZone from './components/UploadZone';
 
-const POLL_INTERVAL_MS = 1500;
+const JOB_POLL_MS = 1500;
+const STATUS_POLL_MS = 2500;
+
+function formatElapsedStatus(baseMessage, elapsedSeconds, dockerActive) {
+  if (dockerActive && elapsedSeconds > 0) {
+    return `${baseMessage}… ${elapsedSeconds}s elapsed`;
+  }
+  return `${baseMessage}…`;
+}
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
@@ -21,6 +30,7 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [analyzed, setAnalyzed] = useState(false);
   const [selectedClass, setSelectedClass] = useState(null);
+  const [selectedClassPath, setSelectedClassPath] = useState(null);
   const [selectedPaths, setSelectedPaths] = useState(new Set());
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -37,6 +47,8 @@ export default function App() {
   const [activeJob, setActiveJob] = useState(null);
   const [jobProgress, setJobProgress] = useState(null);
   const pollRef = useRef(null);
+  const statusPollRef = useRef(null);
+  const statusBaseRef = useRef('');
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -51,12 +63,42 @@ export default function App() {
     refreshHealth();
   }, [refreshHealth]);
 
+  const stopStatusPolling = useCallback(() => {
+    if (statusPollRef.current) {
+      clearInterval(statusPollRef.current);
+      statusPollRef.current = null;
+    }
+  }, []);
+
+  const startStatusPolling = useCallback((sid, baseMessage) => {
+    stopStatusPolling();
+    statusBaseRef.current = baseMessage;
+
+    const pollDockerStatus = async () => {
+      try {
+        const s = await getSessionStatus(sid);
+        // Only update while a Docker container is active; otherwise leave status
+        // to job/analyze handlers (e.g. Ollama generation messages).
+        if (s.active) {
+          const msg = s.message || baseMessage;
+          setStatus(formatElapsedStatus(msg, s.elapsed_seconds, true));
+        }
+      } catch {
+        /* keep last status on poll failure */
+      }
+    };
+
+    pollDockerStatus();
+    statusPollRef.current = setInterval(pollDockerStatus, STATUS_POLL_MS);
+  }, [stopStatusPolling]);
+
   const applyImportResult = useCallback((data, message) => {
     setSessionId(data.session_id);
     setTree(data.tree);
     setStats(data.stats);
     setAnalyzed(false);
     setSelectedClass(null);
+    setSelectedClassPath(null);
     setSelectedPaths(new Set());
     setResults([]);
     setBreakdown(null);
@@ -94,7 +136,9 @@ export default function App() {
   const handleAnalyze = useCallback(async () => {
     if (!sessionId) return;
     setLoading(true);
-    setStatus('Running Maven tests inside Docker container sandbox and JaCoCo analysis…');
+    const baseMsg = 'Running Maven tests inside Docker container sandbox';
+    startStatusPolling(sessionId, baseMsg);
+    setStatus(`${baseMsg}…`);
     try {
       const data = await analyzeProject(sessionId);
       setStats(data.stats);
@@ -103,9 +147,10 @@ export default function App() {
     } catch (e) {
       setStatus(`Analysis error: ${e.message}`);
     } finally {
+      stopStatusPolling();
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, startStatusPolling, stopStatusPolling]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -121,7 +166,7 @@ export default function App() {
     setAnalyzed(true);
   }, []);
 
-  const pollJob = useCallback((jobId) => {
+  const pollJob = useCallback((jobId, sid) => {
     stopPolling();
     pollRef.current = setInterval(async () => {
       try {
@@ -133,10 +178,22 @@ export default function App() {
           message: job.message,
           currentClass: job.current_class,
         });
-        setStatus(job.message || 'Generating tests…');
+
+        if (job.status === 'running' && sid) {
+          try {
+            const s = await getSessionStatus(sid);
+            const msg = s.active && s.message ? s.message : (job.message || 'Generating tests');
+            setStatus(formatElapsedStatus(msg, s.elapsed_seconds, s.active));
+          } catch {
+            setStatus(job.message || 'Generating tests…');
+          }
+        } else {
+          setStatus(job.message || 'Generating tests…');
+        }
 
         if (['completed', 'aborted', 'failed'].includes(job.status)) {
           stopPolling();
+          stopStatusPolling();
           setLoading(false);
           setActiveJob(null);
           applyJobResult(job);
@@ -153,14 +210,23 @@ export default function App() {
         }
       } catch (e) {
         stopPolling();
+        stopStatusPolling();
         setLoading(false);
         setActiveJob(null);
         setStatus(`Job polling error: ${e.message}`);
       }
-    }, POLL_INTERVAL_MS);
-  }, [stopPolling, applyJobResult]);
+    }, JOB_POLL_MS);
+  }, [stopPolling, stopStatusPolling, applyJobResult]);
 
-  useEffect(() => () => stopPolling(), [stopPolling]);
+  useEffect(() => () => {
+    stopPolling();
+    stopStatusPolling();
+  }, [stopPolling, stopStatusPolling]);
+
+  const handleSelectClass = useCallback(({ path, fqcn }) => {
+    setSelectedClassPath(path);
+    setSelectedClass(fqcn);
+  }, []);
 
   const handleToggleClass = useCallback((classPath) => {
     setSelectedPaths((prev) => {
@@ -171,31 +237,7 @@ export default function App() {
     });
   }, []);
 
-  const handleGenerateSingle = useCallback(async () => {
-    if (!sessionId || !selectedClass) {
-      setStatus('Select a Java class from the file tree first.');
-      return;
-    }
-    setLoading(true);
-    setStatus(`Generating test for selected class via Ollama (${health.model})…`);
-    try {
-      const data = await generateTests(sessionId, 'class', selectedClass);
-      setStats(data.stats);
-      setResults(data.results);
-      setBreakdown(data.breakdown);
-      setAnalyzed(true);
-      const passed = data.results.filter((r) => r.tests_passed).length;
-      setStatus(
-        `Generated tests for ${data.results.length} class(es). ${passed} passed Maven sandbox verification.`,
-      );
-    } catch (e) {
-      setStatus(`Generation error: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  }, [sessionId, selectedClass, health.model]);
-
-  const startBatchJob = useCallback(async (scope, classPaths = null) => {
+  const startBatchJob = useCallback(async (scope, classPath = null, classPaths = null) => {
     if (!sessionId) return;
 
     let currentHealth = health;
@@ -214,19 +256,40 @@ export default function App() {
     setLoading(true);
     setActiveJob(null);
     setJobProgress(null);
-    const label = scope === 'project' ? 'full project' : `${classPaths.length} selected class(es)`;
-    setStatus(`Starting ${label} generation via Ollama (${currentHealth.model})…`);
+    const label =
+      scope === 'project'
+        ? 'full project'
+        : scope === 'class'
+          ? `class ${classPath}`
+          : `${classPaths?.length ?? 0} selected class(es)`;
+    const baseMsg = `Starting ${label} generation via Ollama (${currentHealth.model})`;
+    startStatusPolling(sessionId, 'Running Maven tests inside Docker container sandbox');
+    setStatus(`${baseMsg}…`);
 
     try {
-      const { job_id: jobId } = await startGenerateJob(sessionId, scope, classPaths);
+      const { job_id: jobId } = await startGenerateJob(sessionId, scope, classPath, classPaths);
       setActiveJob(jobId);
-      setJobProgress({ status: 'pending', currentIndex: 0, total: classPaths?.length ?? 0, message: 'Job queued…' });
-      pollJob(jobId);
+      setJobProgress({
+        status: 'pending',
+        currentIndex: 0,
+        total: scope === 'class' ? 1 : (classPaths?.length ?? 0),
+        message: 'Job queued…',
+      });
+      pollJob(jobId, sessionId);
     } catch (e) {
+      stopStatusPolling();
       setLoading(false);
       setStatus(`Generation error: ${e.message}`);
     }
-  }, [sessionId, health, pollJob]);
+  }, [sessionId, health, pollJob, startStatusPolling, stopStatusPolling]);
+
+  const handleGenerateSingle = useCallback(async () => {
+    if (!sessionId || !selectedClass) {
+      setStatus('Select a Java class from the file tree first.');
+      return;
+    }
+    await startBatchJob('class', selectedClass);
+  }, [sessionId, selectedClass, startBatchJob]);
 
   const handleGenerateSelected = useCallback(async () => {
     const paths = Array.from(selectedPaths);
@@ -234,7 +297,7 @@ export default function App() {
       setStatus('Select at least one class using the checkboxes.');
       return;
     }
-    await startBatchJob('classes', paths);
+    await startBatchJob('classes', null, paths);
   }, [selectedPaths, startBatchJob]);
 
   const handleGenerateProject = useCallback(async () => {
@@ -292,6 +355,7 @@ export default function App() {
                       onChange={() => {
                         setMultiSelectMode(true);
                         setSelectedClass(null);
+                        setSelectedClassPath(null);
                       }}
                     />
                     Multi-class
@@ -300,10 +364,10 @@ export default function App() {
               </div>
               <FileTree
                 tree={tree}
-                selectedPath={selectedClass}
+                selectedPath={selectedClassPath}
                 selectedPaths={selectedPaths}
                 multiSelect={multiSelectMode}
-                onSelectClass={setSelectedClass}
+                onSelectClass={handleSelectClass}
                 onToggleClass={handleToggleClass}
               />
             </>
@@ -358,7 +422,9 @@ export default function App() {
                 )}
               </div>
               {!multiSelectMode && selectedClass && (
-                <p className="selected-info">Selected: <code>{selectedClass}</code></p>
+                <p className="selected-info">
+                  Selected: <code>{selectedClass}</code>
+                </p>
               )}
               {multiSelectMode && selectedPaths.size > 0 && (
                 <p className="selected-info">{selectedPaths.size} class(es) selected for batch generation</p>
@@ -401,38 +467,7 @@ export default function App() {
             </div>
           )}
 
-          {results.length > 0 && (
-            <div className="results panel">
-              <div className="panel-header">Per-Class Generation Breakdown</div>
-              <ul className="results-list">
-                {results.map((r, i) => (
-                  <li key={i} className={`result-card ${r.status}`}>
-                    <div className="result-top">
-                      <strong className="class-name">{r.class_name || r.class_path}</strong>
-                      <span className={`status-pill ${r.status}`}>
-                        {r.status === 'full_coverage' && 'Full Coverage (≥80%)'}
-                        {r.status === 'partial_coverage' && 'Partial Coverage'}
-                        {r.status === 'failed_to_compile' && 'Failed to Compile'}
-                        {r.status === 'no_change' && 'No Coverage Delta'}
-                      </span>
-                    </div>
-                    <div className="result-paths">
-                      <span className="src-path">{r.class_path}</span>
-                      {r.test_path && <span className="arrow"> → {r.test_path}</span>}
-                    </div>
-                    <div className="result-metrics">
-                      <span>Initial: {r.initial_coverage_pct}%</span>
-                      <span>Final: {r.final_coverage_pct}%</span>
-                      <span className={r.coverage_delta > 0 ? 'delta-pos' : 'delta-zero'}>
-                        Delta: {r.coverage_delta > 0 ? `+${r.coverage_delta}%` : '0%'}
-                      </span>
-                    </div>
-                    <div className="result-msg">{r.message}</div>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+          <GeneratedTestPanel results={results} />
         </section>
       </main>
 

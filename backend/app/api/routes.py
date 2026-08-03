@@ -12,6 +12,7 @@ from app.models.schemas import (
     GenerateRequest,
     GenerateResponse,
     ProjectStats,
+    SessionStatusResponse,
     UploadResponse,
 )
 from app.services import generation_jobs, jacoco, test_generator
@@ -19,6 +20,7 @@ from app.services.generation_jobs import abort_job, create_job, get_job, job_to_
 from app.services.java_parser import compute_static_stats
 from app.services.ollama_client import DEFAULT_MODEL
 from app.services.resource_guard import check_host_memory
+from app.services.session_tracker import get_session_status
 from app.services.workspace import (
     build_file_tree,
     clone_github_repo,
@@ -61,7 +63,11 @@ async def _ensure_coverage(session_id: str, project_root: Path):
         pom = project_root / "pom.xml"
         if pom.exists():
             jacoco.inject_jacoco_plugin(pom)
-            jacoco.run_maven_tests(project_root)
+            jacoco.run_maven_tests(
+                project_root,
+                session_id=session_id,
+                activity_message="Running Maven tests for coverage baseline",
+            )
             report = jacoco.find_jacoco_report(project_root)
             if report:
                 coverage = jacoco.parse_jacoco_report(report)
@@ -132,7 +138,11 @@ async def analyze_project(session_id: str) -> AnalyzeResponse:
         raise HTTPException(status_code=400, detail="No pom.xml found in project")
 
     jacoco.inject_jacoco_plugin(pom)
-    exit_code, maven_out = jacoco.run_maven_tests(project_root)
+    exit_code, maven_out = jacoco.run_maven_tests(
+        project_root,
+        session_id=session_id,
+        activity_message="Running Maven tests for coverage analysis",
+    )
 
     report = jacoco.find_jacoco_report(project_root)
     coverage = jacoco.parse_jacoco_report(report) if report else None
@@ -170,6 +180,7 @@ async def generate_tests(session_id: str, body: GenerateRequest) -> GenerateResp
         body.class_path,
         coverage,
         class_paths=body.class_paths,
+        session_id=session_id,
     )
 
     stats = await test_generator.build_project_stats(project_root, analyzed=True)
@@ -193,13 +204,6 @@ async def start_generate_job(
         raise HTTPException(status_code=404, detail="Session not found")
 
     _validate_generate_scope(body)
-
-    if body.scope == "class":
-        raise HTTPException(
-            status_code=400,
-            detail="Use POST /api/generate/{session_id} for single-class generation",
-        )
-
     _require_ram_for_batch(body.scope)
 
     meta = _session_meta[session_id]
@@ -207,7 +211,9 @@ async def start_generate_job(
     coverage = await _ensure_coverage(session_id, project_root)
 
     job = create_job(session_id, body.scope)
-    if body.scope == "classes":
+    if body.scope == "class":
+        job.total = 1
+    elif body.scope == "classes":
         job.total = len(body.class_paths or [])
     elif body.scope == "project":
         from app.services import java_parser
@@ -248,6 +254,13 @@ async def abort_generate_job(job_id: str) -> dict:
     if not abort_job(job_id):
         raise HTTPException(status_code=404, detail="Job not found or already finished")
     return {"job_id": job_id, "status": "abort_requested"}
+
+
+@router.get("/status/{session_id}", response_model=SessionStatusResponse)
+async def session_status(session_id: str) -> SessionStatusResponse:
+    if session_id not in _session_meta:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionStatusResponse(**get_session_status(session_id))
 
 
 @router.get("/health")
