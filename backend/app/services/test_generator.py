@@ -11,7 +11,7 @@ from app.models.schemas import (
     GenerationResult,
     ProjectStats,
 )
-from app.services import di_resolver, jacoco, java_parser, ollama_client
+from app.services import di_resolver, docker_runner, jacoco, java_parser, ollama_client
 from app.services.java_parser import compute_static_stats
 
 COOLDOWN_SECONDS = float(os.environ.get("GENERATION_COOLDOWN_SECONDS", "3"))
@@ -98,8 +98,13 @@ async def generate_for_class(
     try:
         target_source = java_parser.read_class_content(class_path)
         dependencies = di_resolver.resolve_dependencies(class_path, project_root)
+        referenced_classes = di_resolver.resolve_referenced_classes(
+            class_path, project_root, dependencies
+        )
 
         trivial_lines = java_parser.identify_trivial_lines(target_source)
+        class_kind = java_parser.detect_class_kind(target_source)
+        method_return_types = java_parser.extract_public_method_return_types(target_source)
 
         uncovered: list[int] = []
         if coverage:
@@ -107,12 +112,57 @@ async def generate_for_class(
             uncovered = [ln for ln in raw_uncovered if ln not in trivial_lines]
 
         prompt = ollama_client.build_test_generation_prompt(
-            class_name, target_source, dependencies, uncovered, initial_cov
+            class_name,
+            target_source,
+            dependencies,
+            uncovered,
+            initial_cov,
+            referenced_classes=referenced_classes or None,
+            class_kind=class_kind,
+            method_return_types=method_return_types or None,
         )
-        test_code = await ollama_client.generate_tests(prompt, model=model)
-
         pkg = java_parser.get_package_name(target_source)
+
+        test_code = await ollama_client.generate_tests(
+            prompt,
+            model=model,
+            target_source=target_source,
+            has_di_dependencies=bool(dependencies),
+        )
+
         _write_test_file(test_path, test_code, pkg)
+
+        # Catch known LLM compile-error patterns (e.g. @InjectMocks on entities,
+        # long literals for Integer id setters) and give the model one retry
+        # with the specific issues called out, before wasting a full Maven run.
+        issues = java_parser.check_common_compile_errors(
+            test_code, target_source, has_di_dependencies=bool(dependencies)
+        )
+        if issues:
+            retry_prompt = prompt + "\n\nFIX THESE ISSUES:\n" + "\n".join(f"- {i}" for i in issues)
+            test_code = await ollama_client.generate_tests(
+                retry_prompt, model=model, target_source=target_source, has_di_dependencies=bool(dependencies)
+            )
+            _write_test_file(test_path, test_code, pkg)
+
+        # Spring PetClinic (and similar Spring projects) enforce code formatting
+        # via spring-javaformat-maven-plugin, which fails the build on style
+        # violations independent of whether the code is otherwise correct.
+        # This MUST run last, after any retry rewrite, and immediately before
+        # the final Maven verification build (which runs the `validate` goal
+        # that actually enforces formatting) — otherwise a retry can silently
+        # undo formatting applied earlier.
+        fmt_exit, fmt_out = docker_runner.run_in_docker(
+            project_root,
+            args=["spring-javaformat:apply", "-q"],
+            session_id=session_id,
+            activity_message="Auto-formatting generated test file",
+        )
+        if fmt_exit != 0:
+            # Don't let a silently-failed formatter pass masquerade as a
+            # compile failure in the Maven step below.
+            print(f"[WARNING] spring-javaformat:apply failed (exit {fmt_exit}): {fmt_out[-500:]}")
+
         test_source = test_path.read_text(encoding="utf-8", errors="ignore")
 
         exit_code, maven_out = jacoco.run_maven_tests(

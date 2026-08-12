@@ -26,6 +26,52 @@ PROFILE_RE = re.compile(r'@Profile\s*\(\s*"([^"]+)"\s*\)')
 QUALIFIER_RE = re.compile(r'@Qualifier\s*\(\s*"([^"]+)"\s*\)')
 IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\s*;", re.MULTILINE)
 
+# Types/keywords that are never in-project domain classes
+_NON_TYPE_TOKENS = frozenset({
+    "void", "boolean", "byte", "char", "short", "int", "long", "float", "double",
+    "var", "final", "null", "true", "false", "new", "return", "if", "else", "for",
+    "while", "switch", "case", "default", "try", "catch", "throw", "class", "interface",
+    "enum", "record", "extends", "implements", "import", "package", "public",
+    "protected", "private", "static", "abstract", "synchronized", "native", "strictfp",
+    "this", "super", "else", "do", "break", "continue", "instanceof", "assert",
+})
+
+FIELD_DECL_RE = re.compile(
+    r"(?:private|protected|public)\s+(?:static\s+)?(?:final\s+)?([\w.<>,?\s\[\]]+?)\s+(\w+)\s*(?:=|;)",
+    re.MULTILINE,
+)
+METHOD_DECL_RE = re.compile(
+    r"(?:public|protected|private)\s+(?:static\s+)?(?:synchronized\s+)?(?:<[^>]+>\s+)?"
+    r"([\w.<>,?\s\[\]]+?)\s+(\w+)\s*\(([^)]*)\)",
+    re.MULTILINE,
+)
+LOCAL_VAR_RE = re.compile(
+    r"(?<![\w.])(?:final\s+)?([\w.<>,?\s\[\]]+?)\s+(\w+)\s*=",
+)
+FOR_EACH_RE = re.compile(
+    r"for\s*\(\s*(?:final\s+)?([\w.<>,?\s\[\]]+?)\s+(\w+)\s*:",
+)
+NEW_EXPR_RE = re.compile(
+    r"\bnew\s+([\w.]+(?:<[^>]*>)?)\s*\(",
+)
+PUBLIC_METHOD_SIG_RE = re.compile(
+    r"^\s*(?:public|protected)\s+(?!class|interface|enum|record)"
+    r"(?:static\s+)?(?:<[^>]+>\s+)?([\w.<>,?\s\[\]?]+)\s+(\w+)\s*\([^;{]*\)",
+    re.MULTILINE,
+)
+PUBLIC_FIELD_SIG_RE = re.compile(
+    r"^\s*(?:public|protected)\s+(?:static\s+)?(?:final\s+)?([\w.<>,?\s\[\]?]+)\s+(\w+)\s*[;=]",
+    re.MULTILINE,
+)
+
+LARGE_CLASS_CHAR_THRESHOLD = 4000
+
+ENTITY_RE = re.compile(r"@Entity\b")
+SERVICE_RE = re.compile(r"@Service\b")
+CONTROLLER_RE = re.compile(r"@(?:RestController|Controller)\b")
+REPOSITORY_RE = re.compile(r"@Repository\b")
+COMPONENT_RE = re.compile(r"@Component\b")
+
 
 def _is_test_file(path: Path) -> bool:
     parts = {p.lower() for p in path.parts}
@@ -254,6 +300,199 @@ TRIVIAL_ANNOTATION_RE = re.compile(
 )
 GETTER_SETTER_SIG_RE = re.compile(r"\b(get[A-Z]\w*|set[A-Z]\w*|is[A-Z]\w*)\s*\(")
 EQUALS_HASHCODE_TOSTRING_RE = re.compile(r"\b(equals|hashCode|toString)\s*\(")
+
+
+def extract_nested_type_names(type_str: str) -> list[str]:
+    """Extract simple class names from a type string, including generic parameters."""
+    names: list[str] = []
+    t = type_str.strip()
+    if not t:
+        return names
+
+    base = resolve_type_simple(t.rstrip("[]"))
+    if base and base[0].isupper() and base not in _NON_TYPE_TOKENS:
+        names.append(base)
+
+    for inner in re.findall(r"<([^<>]+(?:<[^<>]*>)?)>", t):
+        for part in inner.split(","):
+            part = part.strip()
+            if part:
+                names.extend(extract_nested_type_names(part))
+
+    if t.endswith("[]"):
+        names.extend(extract_nested_type_names(t[:-2]))
+
+    return names
+
+
+def _types_from_parameter_declaration(param: str) -> list[str]:
+    cleaned = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", param).strip()
+    if not cleaned:
+        return []
+    parts = cleaned.split()
+    if len(parts) < 2:
+        return []
+    type_part = " ".join(parts[:-1])
+    return extract_nested_type_names(type_part)
+
+
+def _split_parameter_list(params: str) -> list[str]:
+    if not params.strip():
+        return []
+    result: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in params + ",":
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            chunk = "".join(current).strip()
+            if chunk:
+                result.append(chunk)
+            current = []
+            continue
+        current.append(ch)
+    return result
+
+
+def extract_referenced_types(content: str) -> list[str]:
+    """
+    Scan fields, method signatures (return/params), and method bodies for
+    referenced Java type names.
+    """
+    found: set[str] = set()
+
+    for m in FIELD_DECL_RE.finditer(content):
+        found.update(extract_nested_type_names(m.group(1)))
+
+    for m in METHOD_DECL_RE.finditer(content):
+        return_type = m.group(1).strip()
+        if return_type not in _NON_TYPE_TOKENS:
+            found.update(extract_nested_type_names(return_type))
+        for param in _split_parameter_list(m.group(3)):
+            found.update(_types_from_parameter_declaration(param))
+
+    for m in LOCAL_VAR_RE.finditer(content):
+        found.update(extract_nested_type_names(m.group(1)))
+
+    for m in FOR_EACH_RE.finditer(content):
+        found.update(extract_nested_type_names(m.group(1)))
+
+    for m in NEW_EXPR_RE.finditer(content):
+        found.update(extract_nested_type_names(m.group(1)))
+
+    return sorted(found)
+
+
+def detect_class_kind(content: str) -> str:
+    """Classify target for test strategy: entity, service, controller, repository, component, plain."""
+    if ENTITY_RE.search(content):
+        return "entity"
+    if SERVICE_RE.search(content):
+        return "service"
+    if CONTROLLER_RE.search(content):
+        return "controller"
+    if REPOSITORY_RE.search(content):
+        return "repository"
+    if COMPONENT_RE.search(content):
+        return "component"
+    return "plain"
+
+
+def extract_public_void_methods(content: str) -> list[tuple[str, str]]:
+    """Return (method_name, param_type) for public void methods with one parameter."""
+    results: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"public\s+void\s+(\w+)\s*\(\s*([\w.<>,?\s\[\]]+?)\s+\w+\s*\)",
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(content):
+        param_type = resolve_type_simple(m.group(2).strip())
+        if param_type and param_type[0].isupper():
+            results.append((m.group(1), param_type))
+    return results
+
+
+def extract_public_method_return_types(content: str) -> list[tuple[str, str]]:
+    """Return (method_name, return_type) for public/protected instance methods."""
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in PUBLIC_METHOD_SIG_RE.finditer(content):
+        return_type = re.sub(r"\s+", " ", m.group(1).strip())
+        method_name = m.group(2)
+        if method_name in seen or return_type in _NON_TYPE_TOKENS:
+            continue
+        seen.add(method_name)
+        results.append((method_name, return_type))
+    return results
+
+
+def check_common_compile_errors(
+    test_source: str,
+    target_source: str,
+    *,
+    has_di_dependencies: bool = False,
+) -> list[str]:
+    """
+    Static checks for frequent LLM compile mistakes against the target class API.
+    """
+    issues: list[str] = []
+
+    if detect_class_kind(target_source) == "entity" and not has_di_dependencies:
+        if "@InjectMocks" in test_source:
+            issues.append(
+                "Do not use @InjectMocks on a JPA entity/domain object; use `new ClassName()` instead"
+            )
+        if "@ExtendWith(MockitoExtension.class)" in test_source:
+            issues.append(
+                "Do not use MockitoExtension for a plain entity; use `new ClassName()` and plain JUnit 5"
+            )
+
+    for method_name, return_type in extract_public_method_return_types(target_source):
+        base_return = resolve_type_simple(return_type)
+        if base_return not in {"Collection", "Iterable"}:
+            continue
+        narrow_assign = re.search(
+            rf"(?:Set|List)<[^>]+>\s+\w+\s*=\s*\w+\.{method_name}\s*\(\s*\)",
+            test_source,
+        )
+        if narrow_assign:
+            issues.append(
+                f"{method_name}() returns {return_type}; do not assign to Set or List without a cast"
+            )
+        indexed_access = re.search(rf"\.{method_name}\s*\(\s*\)\s*\.\s*get\s*\(", test_source)
+        if indexed_access:
+            issues.append(
+                f"{method_name}() returns {return_type}; Collection has no get(index)"
+            )
+
+    if re.search(r"\.setDate\s*\(\s*[\"']", test_source):
+        issues.append("setDate() expects LocalDate, not String")
+
+    return issues
+
+
+def extract_public_api_summary(content: str) -> str:
+    """Compact public/protected field types and method signatures for large classes."""
+    lines: list[str] = []
+    pkg = get_package_name(content)
+    cls = get_class_name(content)
+    if pkg:
+        lines.append(f"package {pkg};")
+    if cls:
+        lines.append(f"// class {cls}")
+    lines.append("// Public / protected API:")
+
+    for m in PUBLIC_FIELD_SIG_RE.finditer(content):
+        lines.append(f"{m.group(1).strip()} {m.group(2)};")
+
+    for m in PUBLIC_METHOD_SIG_RE.finditer(content):
+        sig = re.sub(r"\s+", " ", m.group(0).strip())
+        lines.append(f"{sig};")
+
+    return "\n".join(lines)
 
 
 def identify_trivial_lines(content: str) -> set[int]:

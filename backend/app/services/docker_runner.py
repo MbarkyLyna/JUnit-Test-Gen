@@ -129,6 +129,12 @@ def run_in_docker(
         )
         output = (result.stdout or "") + (result.stderr or "")
 
+        # Debug: dump the full, untruncated Maven/Docker output so it can be
+        # inspected directly after any run, instead of relying on whatever
+        # truncated tail the API response happens to show.
+        with open("full_maven_output.log", "w", encoding="utf-8") as f:
+            f.write(output)
+
         # Exit code 137 indicates OOM killer (SIGKILL) inside container
         if result.returncode == 137:
             oom_msg = (
@@ -140,6 +146,10 @@ def run_in_docker(
         return result.returncode, output
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or "") + (e.stderr or "")
+
+        with open("full_maven_output.log", "w", encoding="utf-8") as f:
+            f.write(out)
+
         timeout_msg = (
             f"{out}\n[DOCKER TIMEOUT FAILURE] Maven execution exceeded the strict limit of {timeout} seconds inside the container sandbox. "
             f"Execution terminated to preserve host resources."

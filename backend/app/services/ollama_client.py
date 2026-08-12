@@ -38,6 +38,9 @@ def build_test_generation_prompt(
     dependencies: list[dict],
     uncovered_lines: list[int],
     coverage_pct: float,
+    referenced_classes: list[dict] | None = None,
+    class_kind: str | None = None,
+    method_return_types: list[tuple[str, str]] | None = None,
 ) -> str:
     dep_section = ""
     for dep in dependencies:
@@ -56,13 +59,36 @@ def build_test_generation_prompt(
                 dep_section += f"Annotations: {impl['annotations']}\n"
             dep_section += f"```java\n{impl.get('source', '')}\n```\n"
 
+    ref_section = ""
+    if referenced_classes:
+        ref_section = (
+            "\nReferenced in-project classes (not injected, but used internally):\n"
+        )
+        for ref in referenced_classes:
+            ref_section += f"\n### {ref['class_name']} ({ref['fqn']})\n"
+            if ref.get("context_kind") == "signatures":
+                ref_section += (
+                    "Public API (signatures only — class too large for full source):\n"
+                )
+            else:
+                ref_section += "Source:\n"
+            ref_section += f"```java\n{ref.get('source', '')}\n```\n"
+
     lines_section = (
         ", ".join(str(l) for l in uncovered_lines[:80])
         if uncovered_lines
         else "No line-level data; cover all non-trivial business logic methods."
     )
 
-    return f"""You are an expert Java/Spring Boot test engineer. Generate a JUnit 5 test class for the target class below.
+    kind_section = f"\nClass kind: {class_kind}\n" if class_kind else ""
+
+    return_types_section = ""
+    if method_return_types:
+        return_types_section = "\nKnown method return types (do not guess these):\n"
+        for method_name, return_type in method_return_types:
+            return_types_section += f"- {method_name} returns {return_type}\n"
+
+    prompt = f"""You are an expert Java/Spring Boot test engineer. Generate a JUnit 5 test class for the target class below.
 
 Requirements:
 - Use JUnit 5 (@Test, @ExtendWith(MockitoExtension.class) or @SpringBootTest as appropriate)
@@ -77,18 +103,25 @@ Requirements:
 - Include meaningful assertions, not empty tests
 - Use the REAL dependency implementations listed below when wiring mocks or test context
 - Output ONLY valid Java code for the test class, no markdown fences or explanation
+- Follow Spring's code formatting conventions strictly, since this project enforces them via a build-time formatter check: use tab indentation (not spaces), place the opening brace on the same line as its declaration, one blank line between methods, imports in a single block with no blank lines between them and no wildcard imports, and no trailing whitespace
 
 Target class: {target_class_name}
-
+{kind_section}
 ```java
 {target_source}
 ```
-
+{return_types_section}
 Resolved Spring DI dependencies (static analysis):
-{dep_section}
-
+{dep_section}{ref_section}
 Generate a complete test class named {target_class_name}Test in the correct package with all imports.
 """
+
+    # Debug: dump the exact prompt sent to the model, so it can be inspected
+    # directly instead of inferring its contents from output quality alone.
+    with open("last_prompt.txt", "w", encoding="utf-8") as f:
+        f.write(prompt)
+
+    return prompt
 
 
 def _trim_to_java_boundaries(code: str) -> str:
@@ -166,7 +199,17 @@ async def generate_tests(
     prompt: str,
     model: str = DEFAULT_MODEL,
     timeout: float = 300.0,
+    target_source: str | None = None,
+    has_di_dependencies: bool = False,
 ) -> str:
+    # NOTE: target_source / has_di_dependencies are accepted here to match the
+    # call signature test_generator.py already uses. Their original intended
+    # behavior in this function was lost when an outdated copy of this file
+    # was restored — they are currently accepted but not used for additional
+    # logic. If you relied on specific behavior tied to these (e.g. rejecting
+    # output that just echoes target_source back unchanged, or adjusting
+    # retry behavior when DI mocking is involved), that logic will need to be
+    # re-added; it is not reconstructable from the file alone.
     async with httpx.AsyncClient(timeout=timeout) as client:
         # Attempt 1
         resp = await client.post(
