@@ -123,11 +123,26 @@ def run_maven_tests(
     timeout: int = 600,
     session_id: str | None = None,
     activity_message: str = "Running Maven tests inside Docker container sandbox",
+    test_filter: str | None = None,
 ) -> tuple[int, str]:
-    """Run mvn test + jacoco:report strictly inside a Docker container sandbox."""
+    """
+    Run mvn test + jacoco:report strictly inside a Docker container sandbox.
+
+    If test_filter is given (e.g. "OwnerTest"), only that test class is
+    executed via Maven's -Dtest flag, instead of the entire suite. The full
+    project still compiles either way (required for the target test to even
+    be reachable), only which tests actually RUN is scoped. Leave test_filter
+    as None for the full, unscoped run used for final/official verification,
+    so the reported coverage and pass/fail result stay based on the whole
+    project rather than a single class.
+    """
+    args = ["test", "jacoco:report", "-DskipTests=false"]
+    if test_filter:
+        args.append(f"-Dtest={test_filter}")
+
     return docker_runner.run_in_docker(
         project_root,
-        args=["test", "jacoco:report", "-DskipTests=false"],
+        args=args,
         timeout=timeout,
         session_id=session_id,
         activity_message=activity_message,

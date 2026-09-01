@@ -40,7 +40,7 @@ def build_test_generation_prompt(
     coverage_pct: float,
     referenced_classes: list[dict] | None = None,
     class_kind: str | None = None,
-    method_return_types: list[tuple[str, str]] | None = None,
+    method_return_types: dict[str, str] | None = None,
 ) -> str:
     dep_section = ""
     for dep in dependencies:
@@ -82,6 +82,43 @@ def build_test_generation_prompt(
 
     kind_section = f"\nClass kind: {class_kind}\n" if class_kind else ""
 
+    entity_instruction = ""
+    if class_kind == "entity":
+        entity_instruction = (
+            "\nThis is a plain entity class. Do NOT use Mockito, @Mock, @InjectMocks, "
+            "when(), or verify() anywhere in this test. Instantiate the class directly "
+            "with `new ClassName()`, call its real methods, and assert on real return "
+            "values. Only mock genuinely external dependencies listed above (if any) — "
+            "never mock the class under test or its own fields.\n"
+            "\nCRITICAL RULE if this class has a collection with an add method guarded "
+            "by isNew() (id == null): you MUST set the id AFTER adding, never before. "
+            "isNew() returns true only when id is null, and add-style methods often only "
+            "add when isNew() is true. Example of the ONLY correct order:\n"
+            "```java\n"
+            "Pet pet = new Pet();\n"
+            "pet.setName(\"Fluffy\");\n"
+            "owner.addPet(pet); // succeeds because pet.getId() is still null here\n"
+            "pet.setId(1); // set the id AFTER adding, never before\n"
+            "Pet found = owner.getPet(1); // now this will correctly find it\n"
+            "```\n"
+            "The WRONG order (id set first) will silently fail to add the item, "
+            "causing every downstream assertion to fail. Do not do this:\n"
+            "```java\n"
+            "Pet pet = new Pet();\n"
+            "pet.setId(1); // WRONG — id is no longer null\n"
+            "owner.addPet(pet); // silently does nothing, isNew() is now false\n"
+            "```\n"
+            "\nWhen a test needs to look an item up by id afterward, still add first, then set id:\n"
+            "```java\n"
+            "Pet pet = new Pet();\n"
+            "pet.setName(\"Fluffy\");\n"
+            "owner.addPet(pet); // add while id is still null\n"
+            "pet.setId(1); // now set the id — the pet is already in the list\n"
+            "Pet found = owner.getPet(1); // works because pet.getId() is now 1\n"
+            "```\n"
+            
+        )
+
     return_types_section = ""
     if method_return_types:
         return_types_section = "\nKnown method return types (do not guess these):\n"
@@ -106,7 +143,7 @@ Requirements:
 - Follow Spring's code formatting conventions strictly, since this project enforces them via a build-time formatter check: use tab indentation (not spaces), place the opening brace on the same line as its declaration, one blank line between methods, imports in a single block with no blank lines between them and no wildcard imports, and no trailing whitespace
 
 Target class: {target_class_name}
-{kind_section}
+{kind_section}{entity_instruction}
 ```java
 {target_source}
 ```

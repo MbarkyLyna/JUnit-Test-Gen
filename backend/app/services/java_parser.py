@@ -445,6 +445,12 @@ def check_common_compile_errors(
             issues.append(
                 "Do not use @InjectMocks on a JPA entity/domain object; use `new ClassName()` instead"
             )
+        if re.search(r"\bwhen\s*\(\s*\w+\.\w+\(", test_source) and "@InjectMocks" in test_source:
+            issues.append(
+                "Do not call when()/verify() on the @InjectMocks object itself — "
+                "it is the real object under test, not a mock. Remove all Mockito "
+                "usage for this entity and call its real methods directly."
+            )
         if "@ExtendWith(MockitoExtension.class)" in test_source:
             issues.append(
                 "Do not use MockitoExtension for a plain entity; use `new ClassName()` and plain JUnit 5"
@@ -468,8 +474,30 @@ def check_common_compile_errors(
                 f"{method_name}() returns {return_type}; Collection has no get(index)"
             )
 
+    if re.search(r"\.setId\s*\(\s*\d+L\s*\)", test_source) or re.search(
+        r"\.getPet\s*\(\s*\d+L\s*\)", test_source
+    ) or re.search(r"\.addVisit\s*\(\s*\d+L\s*,", test_source):
+        issues.append(
+            "IDs in this codebase are Integer, not long/Long — do not use L-suffixed "
+            "long literals (e.g. 1L) for any id/petId argument; use plain int literals (e.g. 1)"
+        )
+
+    if re.search(r"\bowner\.getVisits\s*\(\s*\)", test_source, re.IGNORECASE):
+        issues.append(
+            "Owner has no getVisits() method — visits belong to Pet, not Owner. "
+            "Use pet.getVisits() on a specific Pet instance instead."
+        )
+
     if re.search(r"\.setDate\s*\(\s*[\"']", test_source):
         issues.append("setDate() expects LocalDate, not String")
+    
+    if re.search(r"\.setId\s*\([^)]*\)\s*;[\s\S]{0,300}?\.add(?:Pet|Visit)\s*\(", test_source):
+        issues.append(
+            "Do not call setId() before addPet()/addVisit() — the real "
+            "addPet()/addVisit() logic checks isNew() (true only when id is null) "
+            "before adding. Add the pet/visit FIRST, then set its id afterward, "
+            "or don't set an id at all if the entity is meant to be new."
+        )
 
     return issues
 
@@ -533,4 +561,3 @@ def identify_trivial_lines(content: str) -> set[int]:
             trivial_lines.add(idx)
 
     return trivial_lines
-

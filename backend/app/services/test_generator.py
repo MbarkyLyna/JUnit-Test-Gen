@@ -16,6 +16,14 @@ from app.services.java_parser import compute_static_stats
 
 COOLDOWN_SECONDS = float(os.environ.get("GENERATION_COOLDOWN_SECONDS", "3"))
 
+# How many total attempts to give the model per class before accepting
+# failure. Attempt 1 is the normal generation. Each subsequent attempt feeds
+# back the REAL Maven compiler error and asks the model to fix exactly that,
+# which generalizes to any bug (wrong types, bad imports, hallucinated
+# methods, formatting) instead of requiring a hand-coded check for each
+# failure pattern we happen to have seen.
+MAX_GENERATION_ATTEMPTS = int(os.environ.get("MAX_GENERATION_ATTEMPTS", "3"))
+
 
 def _test_path_for_class(class_path: Path, project_root: Path) -> Path:
     """Map src/main/java/.../Foo.java -> src/test/java/.../FooTest.java"""
@@ -79,6 +87,41 @@ def _resolve_class_path(project_root: Path, class_path_str: str) -> Path:
     return target
 
 
+def _extract_compile_errors(maven_output: str, max_lines: int = 40) -> str:
+    """
+    Pull out just the [ERROR] lines from raw Maven output, so the retry
+    prompt contains the real, specific compiler error instead of noise.
+    """
+    lines = [ln for ln in maven_output.splitlines() if "[ERROR]" in ln]
+    if not lines:
+        # Fall back to the tail of the output if no [ERROR] markers were found
+        # (e.g. a timeout or OOM message rather than a normal compile failure).
+        tail = maven_output.strip().splitlines()
+        return "\n".join(tail[-max_lines:])
+    return "\n".join(lines[:max_lines])
+
+
+def _apply_spring_formatting(
+    project_root: Path, session_id: str | None
+) -> tuple[int, str]:
+    """
+    Auto-format the currently written test file with Spring's formatter, since
+    this project enforces formatting via spring-javaformat-maven-plugin
+    independent of whether the code is otherwise correct. Result is logged to
+    its own file since the shared full_maven_output.log gets overwritten by
+    whatever Maven call runs after this one.
+    """
+    fmt_exit_code, fmt_output = docker_runner.run_in_docker(
+        project_root,
+        args=["spring-javaformat:apply", "-q"],
+        session_id=session_id,
+        activity_message="Auto-formatting generated test file",
+    )
+    with open("format_apply_output.log", "w", encoding="utf-8") as f:
+        f.write(f"EXIT CODE: {fmt_exit_code}\n\n{fmt_output}")
+    return fmt_exit_code, fmt_output
+
+
 async def generate_for_class(
     class_path: Path,
     project_root: Path,
@@ -111,7 +154,7 @@ async def generate_for_class(
             raw_uncovered = jacoco.get_uncovered_for_class(coverage, class_name)
             uncovered = [ln for ln in raw_uncovered if ln not in trivial_lines]
 
-        prompt = ollama_client.build_test_generation_prompt(
+        base_prompt = ollama_client.build_test_generation_prompt(
             class_name,
             target_source,
             dependencies,
@@ -123,54 +166,70 @@ async def generate_for_class(
         )
         pkg = java_parser.get_package_name(target_source)
 
-        test_code = await ollama_client.generate_tests(
-            prompt,
-            model=model,
-            target_source=target_source,
-            has_di_dependencies=bool(dependencies),
-        )
+        current_prompt = base_prompt
+        test_code = ""
+        test_source = ""
+        passed = False
+        maven_out = ""
+        attempts_used = 0
 
-        _write_test_file(test_path, test_code, pkg)
+        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            attempts_used = attempt
 
-        # Catch known LLM compile-error patterns (e.g. @InjectMocks on entities,
-        # long literals for Integer id setters) and give the model one retry
-        # with the specific issues called out, before wasting a full Maven run.
-        issues = java_parser.check_common_compile_errors(
-            test_code, target_source, has_di_dependencies=bool(dependencies)
-        )
-        if issues:
-            retry_prompt = prompt + "\n\nFIX THESE ISSUES:\n" + "\n".join(f"- {i}" for i in issues)
             test_code = await ollama_client.generate_tests(
-                retry_prompt, model=model, target_source=target_source, has_di_dependencies=bool(dependencies)
+                current_prompt,
+                model=model,
+                target_source=target_source,
+                has_di_dependencies=bool(dependencies),
             )
+
+            # Fast, free static pre-check (no Docker run needed) — catches a
+            # handful of well-known LLM mistakes before spending a full Maven
+            # verification cycle on something we already know is wrong.
+            static_issues = java_parser.check_common_compile_errors(
+                test_code, target_source, has_di_dependencies=bool(dependencies)
+            )
+            if static_issues:
+                fix_prompt = (
+                    base_prompt
+                    + "\n\nFIX THESE SPECIFIC ISSUES in your output:\n"
+                    + "\n".join(f"- {i}" for i in static_issues)
+                )
+                test_code = await ollama_client.generate_tests(
+                    fix_prompt,
+                    model=model,
+                    target_source=target_source,
+                    has_di_dependencies=bool(dependencies),
+                )
+
             _write_test_file(test_path, test_code, pkg)
+            _apply_spring_formatting(project_root, session_id)
 
-        # Spring PetClinic (and similar Spring projects) enforce code formatting
-        # via spring-javaformat-maven-plugin, which fails the build on style
-        # violations independent of whether the code is otherwise correct.
-        # This MUST run last, after any retry rewrite, and immediately before
-        # the final Maven verification build (which runs the `validate` goal
-        # that actually enforces formatting) — otherwise a retry can silently
-        # undo formatting applied earlier.
-        fmt_exit, fmt_out = docker_runner.run_in_docker(
-            project_root,
-            args=["spring-javaformat:apply", "-q"],
-            session_id=session_id,
-            activity_message="Auto-formatting generated test file",
-        )
-        if fmt_exit != 0:
-            # Don't let a silently-failed formatter pass masquerade as a
-            # compile failure in the Maven step below.
-            print(f"[WARNING] spring-javaformat:apply failed (exit {fmt_exit}): {fmt_out[-500:]}")
+            # Re-read the file after formatting, since the formatter can
+            # rewrite it in place.
+            test_source = test_path.read_text(encoding="utf-8", errors="ignore")
 
-        test_source = test_path.read_text(encoding="utf-8", errors="ignore")
+            exit_code, maven_out = jacoco.run_maven_tests(
+                project_root,
+                session_id=session_id,
+                activity_message=f"Verifying generated class (attempt {attempt}/{MAX_GENERATION_ATTEMPTS})",
+                test_filter=f"{class_name}Test",
+            )
+            passed = exit_code == 0
 
-        exit_code, maven_out = jacoco.run_maven_tests(
-            project_root,
-            session_id=session_id,
-            activity_message="Running Maven tests for generated class",
-        )
-        passed = exit_code == 0
+            if passed:
+                break
+
+            if attempt < MAX_GENERATION_ATTEMPTS:
+                real_errors = _extract_compile_errors(maven_out)
+                current_prompt = (
+                    base_prompt
+                    + "\n\nYour previous attempt failed to compile/verify with this exact "
+                    "Maven output. Fix these specific errors — do not repeat them:\n\n"
+                    + real_errors
+                    + "\n\nOutput the complete corrected test class, following all the "
+                    "original requirements above."
+                )
 
         final_cov = initial_cov
         report = jacoco.find_jacoco_report(project_root)
@@ -181,16 +240,26 @@ async def generate_for_class(
         delta = round(final_cov - initial_cov, 2)
         if not passed:
             status = "failed_to_compile"
-            msg = "Test generated but failed Maven compilation/execution inside Docker container sandbox."
+            msg = (
+                f"Test generation failed after {attempts_used} attempt(s), including "
+                f"{attempts_used - 1} retry(ies) with real compiler feedback. "
+                "Final Maven compilation/execution still failed inside the Docker sandbox."
+            )
         elif final_cov >= 80.0:
             status = "full_coverage"
-            msg = f"Test generated successfully. Coverage reached {final_cov}% (+{delta}%)."
+            msg = (
+                f"Test generated successfully in {attempts_used} attempt(s). "
+                f"Coverage reached {final_cov}% (+{delta}%)."
+            )
         elif delta > 0:
             status = "partial_coverage"
-            msg = f"Test generated successfully. Coverage improved to {final_cov}% (+{delta}%)."
+            msg = (
+                f"Test generated successfully in {attempts_used} attempt(s). "
+                f"Coverage improved to {final_cov}% (+{delta}%)."
+            )
         else:
             status = "no_change"
-            msg = "Test generated and compiled, but coverage remained unchanged."
+            msg = f"Test generated and compiled in {attempts_used} attempt(s), but coverage remained unchanged."
 
         return GenerationResult(
             class_name=class_name,
