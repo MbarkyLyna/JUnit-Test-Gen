@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.services import neo4j_client
 
 from app.api.routes import router
 
@@ -17,8 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
+# ---------- STARTUP EVENT (add this block) ----------
+@app.on_event("startup")
+async def startup_event():
+    # Initialize Neo4j constraints and indexes
+    neo4j_client.init_graph()
+    # Populate the graph only if it's empty
+    driver = neo4j_client.get_driver()
+    with driver.session() as session:
+        result = session.run("MATCH (c:Class) RETURN count(c) AS cnt")
+        count = result.single()["cnt"]
+        if count == 0:
+            neo4j_client.populate_graph()
+# ----------------------------------------------------
 
+app.include_router(router)
 
 @app.get("/")
 async def root() -> dict:

@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
+from app.services import docker_runner, jacoco   
 from app.models.schemas import FileNode
 
 WORKSPACES_DIR = Path(__file__).resolve().parents[2] / "workspaces"
@@ -53,9 +54,43 @@ def _prepare_project_dir(session_id: str) -> Path:
 
 def _finalize_project_root(project_dir: Path) -> Path:
     root = find_maven_root(project_dir)
-    from app.services import docker_runner
+    from app.services import docker_runner, jacoco, java_parser
+
+    # Step 1: ENFORCE a runnable pom.xml — auto-fixes what it safely can
+    # (packaging, missing Java version) and actually runs `mvn validate`
+    # inside the sandbox to confirm the project builds. Raises ValueError
+    # (not just a printed warning) if it's genuinely not runnable, so the
+    # caller can surface a clear error instead of proceeding into a doomed
+    # generation run.
+    fixes = docker_runner.ensure_runnable_pom(root)
+    for f in fixes:
+        print("pom fix:", f)
+
+    # Step 2: JaCoCo version is chosen to match THIS project's actual Java
+    # version, not a single hardcoded version for every project.
+    java_version = docker_runner.detect_java_version(root)
+    pom = root / "pom.xml"
+    if jacoco.inject_jacoco_plugin(pom, java_version=java_version):
+        print(f"JaCoCo plugin injected/updated in pom.xml for Java {java_version}")
 
     docker_runner.ensure_workspace_writable(root)
+
+    # Step 3: report what will actually be targeted vs excluded, instead of
+    # silently feeding every .java file (including Swing/AWT, package-info,
+    # pure interfaces) into generation.
+    targets = java_parser.list_generation_targets(root)
+    excluded = java_parser.list_excluded_classes(root)
+    groups = java_parser.group_project_classes(root)
+    print(f"Generation targets: {len(targets)} class(es) across {len(groups)} package(s)")
+    if excluded:
+        print(f"Excluded {len(excluded)} file(s): {excluded}")
+
+    # Step 4: naming-convention analysis is computed here for visibility, and
+    # is now ALSO consumed downstream in test_generator._project_context()
+    # so it actually influences generated code instead of being discarded.
+    naming = java_parser.analyze_naming_conventions(root)
+    print(f"Naming summary: {naming}")
+
     return root
 
 

@@ -33,6 +33,8 @@ class GenerationJob:
     maven_output_tail: str = ""
     error: str | None = None
     abort_requested: bool = False
+    naming_summary: dict[str, Any] | None = None
+    excluded_classes: dict[str, str] | None = None
 
 
 _jobs: dict[str, GenerationJob] = {}
@@ -73,6 +75,8 @@ def job_to_dict(job: GenerationJob) -> dict[str, Any]:
         "stats": job.stats.model_dump() if job.stats else None,
         "maven_output_tail": job.maven_output_tail,
         "error": job.error,
+        "naming_summary": job.naming_summary,
+        "excluded_classes": job.excluded_classes,
     }
 
 
@@ -86,6 +90,10 @@ async def run_generation_job(
     model: str,
 ) -> None:
     job.status = "running"
+
+    from app.services import java_parser
+    job.naming_summary = java_parser.analyze_naming_conventions(project_root)
+    job.excluded_classes = java_parser.list_excluded_classes(project_root)
 
     def on_progress(index: int, total: int, class_path: str, message: str) -> None:
         job.current_index = index

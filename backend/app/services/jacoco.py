@@ -1,18 +1,48 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from app.models.schemas import CoverageStats
 from app.services import docker_runner
 
-JACOCO_PLUGIN_SNIPPET = """
+JACOCO_REPORT_EXECUTION = """
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>"""
+
+JACOCO_REPORT_RELATIVE = Path("target/site/jacoco/jacoco.xml")
+
+
+def resolve_jacoco_version(java_version: int) -> str:
+    """
+    JaCoCo version compatibility is real and version-specific: an old JaCoCo
+    can't parse bytecode from a newer javac, and some old bytecode trips up
+    newer JaCoCo. Pick a version known to work with the project's declared
+    Java version instead of pinning one version for every project.
+    """
+    if java_version <= 7:
+        return "0.7.9"
+    if java_version <= 10:
+        return "0.8.5"
+    if java_version <= 16:
+        return "0.8.7"
+    if java_version <= 20:
+        return "0.8.10"
+    return "0.8.12"
+
+
+def _plugin_snippet(version: str) -> str:
+    return f"""
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
-                <version>0.8.12</version>
+                <version>{version}</version>
                 <executions>
                     <execution>
                         <goals>
@@ -29,17 +59,6 @@ JACOCO_PLUGIN_SNIPPET = """
                 </executions>
             </plugin>
 """
-
-JACOCO_REPORT_EXECUTION = """
-                    <execution>
-                        <id>report</id>
-                        <phase>test</phase>
-                        <goals>
-                            <goal>report</goal>
-                        </goals>
-                    </execution>"""
-
-JACOCO_REPORT_RELATIVE = Path("target/site/jacoco/jacoco.xml")
 
 
 def has_jacoco_plugin(pom_path: Path) -> bool:
@@ -87,25 +106,28 @@ def ensure_jacoco_report_execution(pom_path: Path) -> bool:
     return True
 
 
-def inject_jacoco_plugin(pom_path: Path) -> bool:
-    """Ensure JaCoCo plugin and report execution exist in pom.xml. Returns True if modified."""
+def inject_jacoco_plugin(pom_path: Path, java_version: int = 17) -> bool:
+    """Ensure a JaCoCo plugin version compatible with java_version, plus the
+    report execution, exist in pom.xml. Returns True if modified."""
     modified = False
 
     if not has_jacoco_plugin(pom_path):
+        version = resolve_jacoco_version(java_version)
         content = pom_path.read_text(encoding="utf-8", errors="ignore")
+        snippet = _plugin_snippet(version)
 
         if "<plugins>" in content:
-            content = content.replace("<plugins>", f"<plugins>{JACOCO_PLUGIN_SNIPPET}", 1)
+            content = content.replace("<plugins>", f"<plugins>{snippet}", 1)
         elif "</build>" in content:
             content = content.replace(
                 "</build>",
-                f"        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>",
+                f"        <plugins>{snippet}\n        </plugins>\n    </build>",
                 1,
             )
         else:
             content = content.replace(
                 "</project>",
-                f"    <build>\n        <plugins>{JACOCO_PLUGIN_SNIPPET}\n        </plugins>\n    </build>\n</project>",
+                f"    <build>\n        <plugins>{snippet}\n        </plugins>\n    </build>\n</project>",
                 1,
             )
 
@@ -124,17 +146,12 @@ def run_maven_tests(
     session_id: str | None = None,
     activity_message: str = "Running Maven tests inside Docker container sandbox",
     test_filter: str | None = None,
+    docker_image: str | None = None,
 ) -> tuple[int, str]:
     """
-    Run mvn test + jacoco:report strictly inside a Docker container sandbox.
-
-    If test_filter is given (e.g. "OwnerTest"), only that test class is
-    executed via Maven's -Dtest flag, instead of the entire suite. The full
-    project still compiles either way (required for the target test to even
-    be reachable), only which tests actually RUN is scoped. Leave test_filter
-    as None for the full, unscoped run used for final/official verification,
-    so the reported coverage and pass/fail result stay based on the whole
-    project rather than a single class.
+    Run mvn test + jacoco:report strictly inside a Docker container sandbox,
+    using the sandbox image that matches this project's Java version so
+    bytecode/toolchain mismatches don't cause spurious failures.
     """
     args = ["test", "jacoco:report", "-DskipTests=false"]
     if test_filter:
@@ -146,6 +163,7 @@ def run_maven_tests(
         timeout=timeout,
         session_id=session_id,
         activity_message=activity_message,
+        docker_image=docker_image,
     )
 
 
@@ -215,7 +233,6 @@ def parse_jacoco_report(report_path: Path) -> CoverageStats:
         if pkg_name:
             per_package[pkg_name] = _pct(pkg_covered, pkg_missed)
 
-    # Root-level counters
     for counter in root.findall("counter"):
         ctype = counter.get("type")
         c = int(counter.get("covered", 0))

@@ -6,7 +6,7 @@ import re
 import httpx
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "phi4-mini")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5")
 
 
 
@@ -41,6 +41,9 @@ def build_test_generation_prompt(
     referenced_classes: list[dict] | None = None,
     class_kind: str | None = None,
     method_return_types: dict[str, str] | None = None,
+    guarded_add_methods: list[str] | None = None,
+    naming_note: str | None = None,
+    pattern_example: tuple[str, str] | None = None,
 ) -> str:
     dep_section = ""
     for dep in dependencies:
@@ -82,6 +85,19 @@ def build_test_generation_prompt(
 
     kind_section = f"\nClass kind: {class_kind}\n" if class_kind else ""
 
+    naming_section = f"\n{naming_note}\n" if naming_note else ""
+
+    pattern_section = ""
+    if pattern_example:
+        example_code, reason = pattern_example
+        pattern_section = (
+            f"\nA structurally similar class elsewhere in this codebase ({reason}) "
+            "was tested this way. Use it ONLY as a STYLE reference for structure and "
+            "idioms (annotations, mocking approach) — do NOT copy its field names, "
+            "method calls, or assertions; they belong to a different class:\n"
+            f"```java\n{example_code}\n```\n"
+        )
+
     entity_instruction = ""
     if class_kind == "entity":
         entity_instruction = (
@@ -90,34 +106,29 @@ def build_test_generation_prompt(
             "with `new ClassName()`, call its real methods, and assert on real return "
             "values. Only mock genuinely external dependencies listed above (if any) — "
             "never mock the class under test or its own fields.\n"
-            "\nCRITICAL RULE if this class has a collection with an add method guarded "
-            "by isNew() (id == null): you MUST set the id AFTER adding, never before. "
-            "isNew() returns true only when id is null, and add-style methods often only "
-            "add when isNew() is true. Example of the ONLY correct order:\n"
-            "```java\n"
-            "Pet pet = new Pet();\n"
-            "pet.setName(\"Fluffy\");\n"
-            "owner.addPet(pet); // succeeds because pet.getId() is still null here\n"
-            "pet.setId(1); // set the id AFTER adding, never before\n"
-            "Pet found = owner.getPet(1); // now this will correctly find it\n"
-            "```\n"
-            "The WRONG order (id set first) will silently fail to add the item, "
-            "causing every downstream assertion to fail. Do not do this:\n"
-            "```java\n"
-            "Pet pet = new Pet();\n"
-            "pet.setId(1); // WRONG — id is no longer null\n"
-            "owner.addPet(pet); // silently does nothing, isNew() is now false\n"
-            "```\n"
-            "\nWhen a test needs to look an item up by id afterward, still add first, then set id:\n"
-            "```java\n"
-            "Pet pet = new Pet();\n"
-            "pet.setName(\"Fluffy\");\n"
-            "owner.addPet(pet); // add while id is still null\n"
-            "pet.setId(1); // now set the id — the pet is already in the list\n"
-            "Pet found = owner.getPet(1); // works because pet.getId() is now 1\n"
-            "```\n"
-            
         )
+        if guarded_add_methods:
+            methods_list = ", ".join(f"{m}()" for m in guarded_add_methods)
+            example_method = guarded_add_methods[0]
+            entity_instruction += (
+                f"\nCRITICAL RULE: this class's {methods_list} only add the item while "
+                "its id is still null (an isNew()-style guard in the real implementation). "
+                "If you set the item's id BEFORE calling one of these methods, the add will "
+                "silently do nothing and every downstream assertion will fail. Always call "
+                "the add method FIRST while the id is still unset, then set the id "
+                "afterward if you need it for a lookup. Example of the ONLY correct order:\n"
+                "```java\n"
+                "Child child = new Child();\n"
+                f"parent.{example_method}(child); // succeeds because child's id is still null here\n"
+                "child.setId(1); // set the id AFTER adding, never before\n"
+                "```\n"
+                "The WRONG order (id set first) will silently fail to add the item:\n"
+                "```java\n"
+                "Child child = new Child();\n"
+                "child.setId(1); // WRONG — id is no longer null\n"
+                f"parent.{example_method}(child); // silently does nothing now\n"
+                "```\n"
+            )
 
     return_types_section = ""
     if method_return_types:
@@ -149,7 +160,7 @@ Target class: {target_class_name}
 ```
 {return_types_section}
 Resolved Spring DI dependencies (static analysis):
-{dep_section}{ref_section}
+{dep_section}{ref_section}{naming_section}{pattern_section}
 Generate a complete test class named {target_class_name}Test in the correct package with all imports.
 """
 

@@ -6,239 +6,21 @@ Requirements:
 - For external framework beans (e.g., RestTemplate, ObjectMapper, JdbcTemplate, EntityManager, Clock), treat as opaque types and mock them using @Mock or @MockBean
 - For Spring components, use @SpringBootTest or @WebMvcTest with @MockBean where needed
 - Tests MUST compile and pass with Maven
-- Focus specifically on covering these uncovered non-trivial line numbers: No line-level data; cover all non-trivial business logic methods.
+- Focus specifically on covering these uncovered non-trivial line numbers: 130, 160, 172, 197
 - Do NOT waste code or assertions testing Lombok getters/setters, equals/hashCode/toString, or plain DTO field declarations
-- Current class line coverage: 97.73%
+- Current class line coverage: 100.0%
 - Project goal: reach at least 80% overall line coverage
 - Include meaningful assertions, not empty tests
 - Use the REAL dependency implementations listed below when wiring mocks or test context
 - Output ONLY valid Java code for the test class, no markdown fences or explanation
 - Follow Spring's code formatting conventions strictly, since this project enforces them via a build-time formatter check: use tab indentation (not spaces), place the opening brace on the same line as its declaration, one blank line between methods, imports in a single block with no blank lines between them and no wildcard imports, and no trailing whitespace
 
-Target class: Owner
+Target class: Pet
 
 Class kind: entity
 
 This is a plain entity class. Do NOT use Mockito, @Mock, @InjectMocks, when(), or verify() anywhere in this test. Instantiate the class directly with `new ClassName()`, call its real methods, and assert on real return values. Only mock genuinely external dependencies listed above (if any) — never mock the class under test or its own fields.
 
-CRITICAL RULE if this class has a collection with an add method guarded by isNew() (id == null): you MUST set the id AFTER adding, never before. isNew() returns true only when id is null, and add-style methods often only add when isNew() is true. Example of the ONLY correct order:
-```java
-Pet pet = new Pet();
-pet.setName("Fluffy");
-owner.addPet(pet); // succeeds because pet.getId() is still null here
-pet.setId(1); // set the id AFTER adding, never before
-Pet found = owner.getPet(1); // now this will correctly find it
-```
-The WRONG order (id set first) will silently fail to add the item, causing every downstream assertion to fail. Do not do this:
-```java
-Pet pet = new Pet();
-pet.setId(1); // WRONG — id is no longer null
-owner.addPet(pet); // silently does nothing, isNew() is now false
-```
-
-When a test needs to look an item up by id afterward, still add first, then set id:
-```java
-Pet pet = new Pet();
-pet.setName("Fluffy");
-owner.addPet(pet); // add while id is still null
-pet.setId(1); // now set the id — the pet is already in the list
-Pet found = owner.getPet(1); // works because pet.getId() is now 1
-```
-
-```java
-/*
- * Copyright 2012-2025 the original author or authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-package org.springframework.samples.petclinic.owner;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
-import org.springframework.core.style.ToStringCreator;
-import org.springframework.samples.petclinic.model.Person;
-import org.springframework.util.Assert;
-
-import jakarta.persistence.CascadeType;
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.FetchType;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.OneToMany;
-import jakarta.persistence.OrderBy;
-import jakarta.persistence.Table;
-import jakarta.validation.constraints.Pattern;
-import jakarta.validation.constraints.NotBlank;
-
-/**
- * Simple JavaBean domain object representing an owner.
- *
- * @author Ken Krebs
- * @author Juergen Hoeller
- * @author Sam Brannen
- * @author Michael Isvy
- * @author Oliver Drotbohm
- * @author Wick Dynex
- */
-@Entity
-@Table(name = "owners")
-public class Owner extends Person {
-
-	@Column
-	@NotBlank
-	private String address;
-
-	@Column
-	@NotBlank
-	private String city;
-
-	@Column
-	@NotBlank
-	@Pattern(regexp = "\\d{10}", message = "{telephone.invalid}")
-	private String telephone;
-
-	@OneToMany(cascade = CascadeType.ALL, fetch = FetchType.EAGER)
-	@JoinColumn(name = "owner_id")
-	@OrderBy("name")
-	private final List<Pet> pets = new ArrayList<>();
-
-	public String getAddress() {
-		return this.address;
-	}
-
-	public void setAddress(String address) {
-		this.address = address;
-	}
-
-	public String getCity() {
-		return this.city;
-	}
-
-	public void setCity(String city) {
-		this.city = city;
-	}
-
-	public String getTelephone() {
-		return this.telephone;
-	}
-
-	public void setTelephone(String telephone) {
-		this.telephone = telephone;
-	}
-
-	public List<Pet> getPets() {
-		return this.pets;
-	}
-
-	public void addPet(Pet pet) {
-		if (pet.isNew()) {
-			getPets().add(pet);
-		}
-	}
-
-	/**
-	 * Return the Pet with the given name, or null if none found for this Owner.
-	 * @param name to test
-	 * @return the Pet with the given name, or null if no such Pet exists for this Owner
-	 */
-	public Pet getPet(String name) {
-		return getPet(name, false);
-	}
-
-	/**
-	 * Return the Pet with the given id, or null if none found for this Owner.
-	 * @param id to test
-	 * @return the Pet with the given id, or null if no such Pet exists for this Owner
-	 */
-	public Pet getPet(Integer id) {
-		for (Pet pet : getPets()) {
-			if (!pet.isNew()) {
-				Integer compId = pet.getId();
-				if (Objects.equals(compId, id)) {
-					return pet;
-				}
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * Return the Pet with the given name, or null if none found for this Owner.
-	 * @param name to test
-	 * @param ignoreNew whether to ignore new pets (pets that are not saved yet)
-	 * @return the Pet with the given name, or null if no such Pet exists for this Owner
-	 */
-	public Pet getPet(String name, boolean ignoreNew) {
-		for (Pet pet : getPets()) {
-			String compName = pet.getName();
-			if (compName != null && compName.equalsIgnoreCase(name)) {
-				if (!ignoreNew || !pet.isNew()) {
-					return pet;
-				}
-			}
-		}
-		return null;
-	}
-
-	@Override
-	public String toString() {
-		return new ToStringCreator(this).append("id", this.getId())
-			.append("new", this.isNew())
-			.append("lastName", this.getLastName())
-			.append("firstName", this.getFirstName())
-			.append("address", this.address)
-			.append("city", this.city)
-			.append("telephone", this.telephone)
-			.toString();
-	}
-
-	/**
-	 * Adds the given {@link Visit} to the {@link Pet} with the given identifier.
-	 * @param petId the identifier of the {@link Pet}, must not be {@literal null}.
-	 * @param visit the visit to add, must not be {@literal null}.
-	 */
-	public void addVisit(Integer petId, Visit visit) {
-
-		Assert.notNull(petId, "Pet identifier must not be null!");
-		Assert.notNull(visit, "Visit must not be null!");
-
-		Pet pet = getPet(petId);
-
-		Assert.notNull(pet, "Invalid Pet identifier!");
-
-		pet.addVisit(visit);
-	}
-
-}
-
-```
-
-Known method return types (do not guess these):
-- getAddress returns String
-- getCity returns String
-- getTelephone returns String
-- getPets returns List<Pet>
-- getPet returns Pet
-- toString returns String
-
-Resolved Spring DI dependencies (static analysis):
-
-Referenced in-project classes (not injected, but used internally):
-
-### Pet (org.springframework.samples.petclinic.owner.Pet)
-Source:
 ```java
 /*
  * Copyright 2012-2025 the original author or authors.
@@ -328,6 +110,51 @@ public class Pet extends NamedEntity {
 
 ```
 
+Known method return types (do not guess these):
+- getBirthDate returns LocalDate
+- getType returns PetType
+- getVisits returns Collection<Visit>
+
+Resolved Spring DI dependencies (static analysis):
+
+Referenced in-project classes (not injected, but used internally):
+
+### PetType (org.springframework.samples.petclinic.owner.PetType)
+Source:
+```java
+/*
+ * Copyright 2012-2025 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.springframework.samples.petclinic.owner;
+
+import org.springframework.samples.petclinic.model.NamedEntity;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.Table;
+
+/**
+ * @author Juergen Hoeller Can be Cat, Dog, Hamster...
+ */
+@Entity
+@Table(name = "types")
+public class PetType extends NamedEntity {
+
+}
+
+```
+
 ### Visit (org.springframework.samples.petclinic.owner.Visit)
 Source:
 ```java
@@ -402,4 +229,4 @@ public class Visit extends BaseEntity {
 
 ```
 
-Generate a complete test class named OwnerTest in the correct package with all imports.
+Generate a complete test class named PetTest in the correct package with all imports.

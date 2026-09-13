@@ -64,6 +64,28 @@ PUBLIC_FIELD_SIG_RE = re.compile(
     re.MULTILINE,
 )
 
+# --- Generic structural-detection helpers used by check_common_compile_errors ---
+# These replace what used to be hardcoded checks against one specific domain
+# model (Owner/Pet/addVisit/setDate) so the same checks work on any Spring
+# Boot project's own classes.
+ID_ANNOTATION_FIELD_RE = re.compile(
+    r"@Id\b[\s\S]{0,200}?(?:private|protected|public)\s+([\w.<>]+)\s+(\w+)\s*;",
+    re.MULTILINE,
+)
+PLAIN_ID_FIELD_RE = re.compile(
+    r"(?:private|protected|public)\s+([\w.<>]+)\s+id\s*;",
+    re.MULTILINE,
+)
+SETTER_PARAM_RE = re.compile(
+    r"(?:public|protected)\s+\w+\s+(set\w+)\s*\(\s*([\w.<>\[\]]+)\s+\w+\s*\)",
+    re.MULTILINE,
+)
+METHOD_SIG_START_RE = re.compile(
+    r"(?:public|protected)\s+(?:static\s+)?(?:synchronized\s+)?(?:<[^>]+>\s+)?"
+    r"[\w.<>,?\[\]]+\s+(\w+)\s*\([^;{]*\)\s*(?:throws\s+[\w.,\s]+)?\{",
+    re.MULTILINE,
+)
+
 LARGE_CLASS_CHAR_THRESHOLD = 4000
 
 ENTITY_RE = re.compile(r"@Entity\b")
@@ -71,6 +93,20 @@ SERVICE_RE = re.compile(r"@Service\b")
 CONTROLLER_RE = re.compile(r"@(?:RestController|Controller)\b")
 REPOSITORY_RE = re.compile(r"@Repository\b")
 COMPONENT_RE = re.compile(r"@Component\b")
+
+# --- Step 3: exclusion detection ---
+# Swing/AWT and other desktop-GUI code is not relevant to a Spring Boot
+# unit-test generator: it isn't wired through DI, has no meaningful line
+# coverage target in this context, and generated Mockito tests for it are
+# almost always nonsensical (mocking a JButton achieves nothing).
+_SWING_AWT_IMPORT_RE = re.compile(r"^\s*import\s+(?:javax\.swing|java\.awt)\.", re.MULTILINE)
+_SWING_SUPERCLASS_RE = re.compile(
+    r"\bextends\s+(?:J?Frame|J?Panel|J?Dialog|Applet|Canvas|Window|JApplet)\b"
+)
+_INTERFACE_DECL_RE = re.compile(r"^\s*(?:public\s+)?interface\s+\w+", re.MULTILINE)
+_DEFAULT_OR_STATIC_METHOD_RE = re.compile(
+    r"\b(?:default|static)\s+[\w.<>\[\]]+\s+\w+\s*\([^;{]*\)\s*\{"
+)
 
 
 def _is_test_file(path: Path) -> bool:
@@ -291,6 +327,69 @@ def list_main_classes(project_root: Path) -> list[Path]:
     return [f for f in collect_java_files(project_root) if _is_main_source(f)]
 
 
+def classify_exclusion(path: Path, content: str) -> str | None:
+    """
+    Return a human-readable reason if this file should be EXCLUDED from test
+    generation, or None if it's a valid target. This is Step 3's actual
+    filtering — grouping is meaningless without first removing files that
+    aren't real, testable classes.
+    """
+    name = path.name
+
+    if name in {"package-info.java", "module-info.java"}:
+        return "package-info/module-info — not a class declaration"
+
+    if _SWING_AWT_IMPORT_RE.search(content) or _SWING_SUPERCLASS_RE.search(content):
+        return "Swing/AWT desktop-GUI class — irrelevant to Spring Boot unit test generation"
+
+    if not CLASS_RE.search(content):
+        return "no class/interface/enum/record declaration found in file"
+
+    if _INTERFACE_DECL_RE.search(content) and not _DEFAULT_OR_STATIC_METHOD_RE.search(content):
+        return "pure interface with no default/static method bodies — nothing to unit test directly"
+
+    return None
+
+
+def list_generation_targets(project_root: Path) -> list[Path]:
+    """Main classes eligible for test generation: excludes package-info/
+    module-info, Swing/AWT GUI classes, and pure interfaces with no
+    implemented method bodies. Use this instead of list_main_classes()
+    anywhere generation actually happens."""
+    targets: list[Path] = []
+    for f in list_main_classes(project_root):
+        content = read_class_content(f)
+        if classify_exclusion(f, content) is None:
+            targets.append(f)
+    return targets
+
+
+def list_excluded_classes(project_root: Path) -> dict[str, str]:
+    """Map excluded file stem -> reason, for reporting to the user/UI so the
+    exclusion isn't silent."""
+    excluded: dict[str, str] = {}
+    for f in list_main_classes(project_root):
+        content = read_class_content(f)
+        reason = classify_exclusion(f, content)
+        if reason:
+            excluded[f.stem] = reason
+    return excluded
+
+
+def group_project_classes(project_root: Path) -> dict[str, list[str]]:
+    """Group eligible (non-excluded) class simple names by their Java
+    package, for orderly, report-friendly processing and display."""
+    groups: dict[str, list[str]] = {}
+    for f in list_generation_targets(project_root):
+        content = read_class_content(f)
+        pkg = get_package_name(content) or "(default package)"
+        cls = get_class_name(content) or f.stem
+        groups.setdefault(pkg, []).append(cls)
+    for pkg in groups:
+        groups[pkg].sort()
+    return groups
+
+
 def empty_stats() -> ProjectStats:
     return ProjectStats(static=StaticStats(), coverage=None, analyzed=False)
 
@@ -429,6 +528,81 @@ def extract_public_method_return_types(content: str) -> list[tuple[str, str]]:
     return results
 
 
+def detect_id_type(content: str) -> str | None:
+    """
+    Find the real type of this class's id field — via @Id (JPA) first, then a
+    plain field literally named `id` — so id-related checks work on any
+    entity's actual type instead of assuming Integer.
+    """
+    m = ID_ANNOTATION_FIELD_RE.search(content)
+    if m:
+        return resolve_type_simple(m.group(1))
+    m2 = PLAIN_ID_FIELD_RE.search(content)
+    if m2:
+        return resolve_type_simple(m2.group(1))
+    return None
+
+
+def extract_setter_param_types(content: str) -> dict[str, str]:
+    """Map setter method name -> its parameter's simple type, from the real class source."""
+    return {
+        m.group(1): resolve_type_simple(m.group(2))
+        for m in SETTER_PARAM_RE.finditer(content)
+    }
+
+
+def _extract_method_bodies(content: str) -> dict[str, str]:
+    """Map method name -> brace-matched body text, for public/protected methods."""
+    bodies: dict[str, str] = {}
+    for m in METHOD_SIG_START_RE.finditer(content):
+        name = m.group(1)
+        start = m.end() - 1  # position of the opening '{'
+        depth = 0
+        i = start
+        while i < len(content):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        bodies[name] = content[start : i + 1]
+    return bodies
+
+
+def find_id_guarded_add_methods(content: str) -> list[str]:
+    """
+    Find add*-style methods whose own body guards insertion on an isNew()-style
+    or null-id check. Any such method requires callers to add the item BEFORE
+    setting its id — this is detected from the real method body, not assumed
+    for specific hardcoded method names.
+    """
+    guarded: list[str] = []
+    for name, body in _extract_method_bodies(content).items():
+        if not name.lower().startswith("add"):
+            continue
+        if re.search(r"isNew\s*\(\s*\)", body) or re.search(r"getId\s*\(\s*\)\s*==\s*null", body):
+            guarded.append(name)
+    return guarded
+
+
+def find_undefined_target_method_calls(test_source: str, target_source: str) -> list[str]:
+    """
+    Heuristically catch hallucinated no-arg getter/is calls on a variable that
+    looks like an instance of the target class (e.g. `owner` for class Owner),
+    where that method isn't actually defined on the target class.
+    """
+    class_name = get_class_name(target_source)
+    if not class_name:
+        return []
+    var_hint = class_name[0].lower() + class_name[1:]
+    known = {name for name, _ in extract_public_method_return_types(target_source)}
+    known |= {name for name, _ in extract_public_void_methods(target_source)}
+    calls = re.findall(rf"\b{re.escape(var_hint)}\.((?:get|is)\w*)\s*\(\s*\)", test_source)
+    return sorted({c for c in calls if c not in known})
+
+
 def check_common_compile_errors(
     test_source: str,
     target_source: str,
@@ -436,11 +610,15 @@ def check_common_compile_errors(
     has_di_dependencies: bool = False,
 ) -> list[str]:
     """
-    Static checks for frequent LLM compile mistakes against the target class API.
+    Static checks for frequent LLM compile mistakes, derived dynamically from
+    the target class's own structure (real id type, real setter param types,
+    real guarded add-methods, real method names) so they generalize to any
+    Spring Boot project instead of one specific hardcoded domain model.
     """
     issues: list[str] = []
+    class_kind = detect_class_kind(target_source)
 
-    if detect_class_kind(target_source) == "entity" and not has_di_dependencies:
+    if class_kind == "entity" and not has_di_dependencies:
         if "@InjectMocks" in test_source:
             issues.append(
                 "Do not use @InjectMocks on a JPA entity/domain object; use `new ClassName()` instead"
@@ -474,30 +652,38 @@ def check_common_compile_errors(
                 f"{method_name}() returns {return_type}; Collection has no get(index)"
             )
 
-    if re.search(r"\.setId\s*\(\s*\d+L\s*\)", test_source) or re.search(
-        r"\.getPet\s*\(\s*\d+L\s*\)", test_source
-    ) or re.search(r"\.addVisit\s*\(\s*\d+L\s*,", test_source):
+    id_type = detect_id_type(target_source)
+    if id_type in {"Integer", "int"}:
+        if re.search(r"\.set\w*[Ii]d\w*\s*\(\s*\d+L\s*\)", test_source) or re.search(
+            r"\.(?:get|find)\w*\s*\(\s*\d+L\s*(?:,|\))", test_source
+        ):
+            issues.append(
+                f"IDs on this class are {id_type}, not long/Long — do not use L-suffixed "
+                "long literals (e.g. 1L) for id arguments; use plain int literals (e.g. 1)"
+            )
+
+    for call in find_undefined_target_method_calls(test_source, target_source):
         issues.append(
-            "IDs in this codebase are Integer, not long/Long — do not use L-suffixed "
-            "long literals (e.g. 1L) for any id/petId argument; use plain int literals (e.g. 1)"
+            f"{call}() does not exist on {get_class_name(target_source) or 'the target class'} "
+            "— check the real class for the correct method or field before calling it"
         )
 
-    if re.search(r"\bowner\.getVisits\s*\(\s*\)", test_source, re.IGNORECASE):
-        issues.append(
-            "Owner has no getVisits() method — visits belong to Pet, not Owner. "
-            "Use pet.getVisits() on a specific Pet instance instead."
-        )
+    for setter, ptype in extract_setter_param_types(target_source).items():
+        if ptype in {"LocalDate", "LocalDateTime", "LocalTime", "Date", "Instant"}:
+            if re.search(rf"\.{setter}\s*\(\s*[\"']", test_source):
+                issues.append(f"{setter}() expects {ptype}, not a String literal")
 
-    if re.search(r"\.setDate\s*\(\s*[\"']", test_source):
-        issues.append("setDate() expects LocalDate, not String")
-    
-    if re.search(r"\.setId\s*\([^)]*\)\s*;[\s\S]{0,300}?\.add(?:Pet|Visit)\s*\(", test_source):
-        issues.append(
-            "Do not call setId() before addPet()/addVisit() — the real "
-            "addPet()/addVisit() logic checks isNew() (true only when id is null) "
-            "before adding. Add the pet/visit FIRST, then set its id afterward, "
-            "or don't set an id at all if the entity is meant to be new."
-        )
+    if class_kind == "entity":
+        for method_name in find_id_guarded_add_methods(target_source):
+            pattern = re.compile(
+                rf"\.setId\s*\([^)]*\)\s*;[\s\S]{{0,300}}?\.{method_name}\s*\("
+            )
+            if pattern.search(test_source):
+                issues.append(
+                    f"Do not call setId() before {method_name}() — its real implementation "
+                    "only adds the item while its id is still null (an isNew()-style guard). "
+                    f"Call {method_name}() first, then set the id afterward if you need it."
+                )
 
     return issues
 
@@ -561,3 +747,91 @@ def identify_trivial_lines(content: str) -> set[int]:
             trivial_lines.add(idx)
 
     return trivial_lines
+
+# ===== NAMING CONVENTION ANALYSIS (Step 4) =====
+# Concept-suffix pairs where the same architectural role is named two
+# different ways in the same codebase (a real semantic inconsistency, not
+# just a style preference) — e.g. one class ends in "Manager", another in
+# "Mgr", for what should be a consistent layer-naming convention.
+_ABBREVIATION_PAIRS = [
+    ("Manager", "Mgr"),
+    ("Controller", "Ctrl"),
+    ("Repository", "Repo"),
+    ("Service", "Svc"),
+    ("Configuration", "Config"),
+    ("Utility", "Util"),
+    ("Implementation", "Impl"),
+]
+
+
+def analyze_naming_conventions(project_root: Path) -> dict:
+    """
+    Scan all main classes and return BOTH a lexical style summary (camelCase
+    vs snake_case ratio) AND semantic inconsistencies: mixed abbreviation
+    styles for the same architectural concept, and individual class names
+    that break the codebase's dominant casing convention.
+    """
+    classes = list_main_classes(project_root)
+    names = []
+    for cls_path in classes:
+        content = read_class_content(cls_path)
+        name = get_class_name(content) or cls_path.stem
+        names.append(name)
+
+    total = len(names)
+    camel = sum(1 for n in names if re.match(r'^[A-Z][a-zA-Z0-9]*$', n))
+    snake = sum(1 for n in names if '_' in n)
+    other = total - camel - snake
+
+    abbreviation_inconsistencies: list[str] = []
+    for full, abbrev in _ABBREVIATION_PAIRS:
+        has_full = any(n.endswith(full) for n in names)
+        has_abbrev = any(n.endswith(abbrev) for n in names)
+        if has_full and has_abbrev:
+            abbreviation_inconsistencies.append(
+                f"Mixed use of '{full}' and '{abbrev}' suffixes across classes in this project"
+            )
+
+    naming_outliers: list[str] = []
+    if total:
+        dominant_is_camel = camel >= snake
+        for n in names:
+            is_camel = bool(re.match(r'^[A-Z][a-zA-Z0-9]*$', n))
+            is_snake = '_' in n
+            if dominant_is_camel and is_snake:
+                naming_outliers.append(n)
+            elif not dominant_is_camel and is_camel and snake > camel:
+                naming_outliers.append(n)
+
+    return {
+        "total": total,
+        "camel_case": camel,
+        "snake_case": snake,
+        "other": other,
+        "ratio_camel": round(camel / total, 2) if total else 0,
+        "abbreviation_inconsistencies": abbreviation_inconsistencies,
+        "naming_outliers": naming_outliers,
+    }
+
+
+def naming_conventions_prompt_note(summary: dict) -> str | None:
+    """
+    Turn the naming summary into a short instruction block for the LLM
+    prompt, so the analysis actually influences generated code instead of
+    being printed and discarded. Returns None if nothing is worth flagging.
+    """
+    notes: list[str] = []
+    notes.extend(summary.get("abbreviation_inconsistencies", []))
+    outliers = summary.get("naming_outliers", [])
+    if outliers:
+        notes.append(
+            "These classes break the project's dominant naming style: "
+            + ", ".join(outliers[:10])
+        )
+    if not notes:
+        return None
+    return (
+        "Project naming-convention notes (match the DOMINANT existing style for "
+        "any new identifiers you introduce, e.g. local variable and helper names):\n- "
+        + "\n- ".join(notes)
+    )
