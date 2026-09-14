@@ -38,6 +38,7 @@ class UploadResponse(BaseModel):
     tree: FileNode
     stats: ProjectStats
     project_root: str
+    project_info: dict | None = None
 
 
 class CloneRequest(BaseModel):
@@ -49,6 +50,7 @@ class AnalyzeResponse(BaseModel):
     session_id: str
     stats: ProjectStats
     maven_output_tail: str = ""
+    project_info: dict | None = None
 
 
 class GenerateRequest(BaseModel):

@@ -211,3 +211,63 @@ def cleanup_session(session_id: str) -> None:
     if session_dir and session_dir.exists():
         shutil.rmtree(session_dir, ignore_errors=True)
     _sessions.pop(session_id, None)
+    
+def _first_pom_tag(tag: str, xml_text: str) -> str | None:
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", xml_text, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+def get_project_info(project_root: Path) -> dict | None:
+    """
+    Lightweight pom.xml summary shown in the UI after upload/analyze
+    (artifact coordinates, detected Java version, class/package/test counts).
+    Returns None if there's no pom.xml (upload response still renders, just
+    without this panel).
+    """
+    pom = project_root / "pom.xml"
+    if not pom.exists():
+        return None
+
+    content = pom.read_text(encoding="utf-8", errors="ignore")
+
+    # Pull <parent> out first so its groupId/version/artifactId don't get
+    # mistaken for the project's own — Spring Boot poms almost always
+    # inherit groupId/version from spring-boot-starter-parent.
+    parent_match = re.search(r"<parent>(.*?)</parent>", content, re.DOTALL)
+    parent_group_id = parent_artifact_id = parent_version = None
+    without_parent = content
+    if parent_match:
+        parent_block = parent_match.group(1)
+        parent_group_id = _first_pom_tag("groupId", parent_block)
+        parent_artifact_id = _first_pom_tag("artifactId", parent_block)
+        parent_version = _first_pom_tag("version", parent_block)
+        without_parent = content[: parent_match.start()] + content[parent_match.end() :]
+
+    group_id = _first_pom_tag("groupId", without_parent) or parent_group_id
+    artifact_id = _first_pom_tag("artifactId", without_parent)
+    version = _first_pom_tag("version", without_parent) or parent_version
+    name = _first_pom_tag("name", without_parent)
+    packaging = _first_pom_tag("packaging", without_parent) or "jar"
+
+    is_spring_boot = bool(
+        parent_artifact_id and "spring-boot-starter-parent" in parent_artifact_id
+    ) or "spring-boot" in without_parent
+
+    from app.services import java_parser
+
+    java_version = docker_runner.detect_java_version(project_root)
+    static_stats = java_parser.compute_static_stats(project_root)
+
+    return {
+        "name": name or artifact_id,
+        "group_id": group_id,
+        "artifact_id": artifact_id,
+        "version": version,
+        "packaging": packaging,
+        "java_version": java_version,
+        "is_spring_boot": is_spring_boot,
+        "spring_boot_version": parent_version if is_spring_boot else None,
+        "class_count": static_stats.class_count,
+        "package_count": static_stats.package_count,
+        "test_count": static_stats.test_count,
+    }

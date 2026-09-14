@@ -11,6 +11,7 @@ import {
 } from './api/client';
 import FileTree from './components/FileTree';
 import GeneratedTestPanel from './components/GeneratedTestPanel';
+import ProjectInfoPanel from './components/ProjectInfoPanel';
 import StatsPanel from './components/StatsPanel';
 import UploadZone from './components/UploadZone';
 
@@ -46,6 +47,7 @@ export default function App() {
   });
   const [activeJob, setActiveJob] = useState(null);
   const [jobProgress, setJobProgress] = useState(null);
+  const [projectInfo, setProjectInfo] = useState(null);
   const pollRef = useRef(null);
   const statusPollRef = useRef(null);
   const statusBaseRef = useRef('');
@@ -96,6 +98,7 @@ export default function App() {
     setSessionId(data.session_id);
     setTree(data.tree);
     setStats(data.stats);
+    setProjectInfo(data.project_info || null);
     setAnalyzed(false);
     setSelectedClass(null);
     setSelectedClassPath(null);
@@ -142,6 +145,7 @@ export default function App() {
     try {
       const data = await analyzeProject(sessionId);
       setStats(data.stats);
+      if (data.project_info) setProjectInfo(data.project_info);
       setAnalyzed(true);
       setStatus('Analysis complete.');
     } catch (e) {
@@ -375,6 +379,8 @@ export default function App() {
         </section>
 
         <section className="right-column">
+          <ProjectInfoPanel info={projectInfo} />
+
           <StatsPanel
             stats={stats}
             analyzed={analyzed}

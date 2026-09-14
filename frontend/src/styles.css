@@ -853,3 +853,53 @@ body {
   color: var(--text-dim);
   font-size: 0.82rem;
 }
+/* ===== Project Info panel (additive — appended, does not modify any existing rule) ===== */
+.project-info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  padding: 1rem;
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.info-item-wide {
+  grid-column: 1 / -1;
+}
+
+.info-label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.info-value {
+  font-size: 0.875rem;
+  color: var(--text);
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.info-value code {
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.78rem;
+  background: var(--surface-muted);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+}
+
+.warn-badge {
+  background: var(--warn);
+  color: #fff;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+}

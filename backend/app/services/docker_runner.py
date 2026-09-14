@@ -87,6 +87,41 @@ def validate_maven_project(project_root: Path) -> list[str]:
     return issues
 
 
+def _inject_packaging(content: str) -> tuple[str, bool]:
+    """
+    Insert <packaging>jar</packaging> as a direct child of <project>.
+
+    IMPORTANT: a naive "replace the first </version>" is wrong whenever the
+    pom has a <parent> block (e.g. spring-boot-starter-parent) — that block
+    also contains a </version> tag, and it comes BEFORE the project's own
+    </version>. Blindly replacing the first occurrence drops <packaging>
+    *inside* <parent>, which is not a valid child there and breaks the pom
+    ("Unrecognised tag: 'packaging'"). Anchor on </parent> when present, and
+    only fall back to the </version> heuristic when there's no parent block
+    to get confused by.
+    """
+    if "<packaging>" in content:
+        return content, False
+
+    parent_match = re.search(r"</parent>", content)
+    if parent_match:
+        insert_at = parent_match.end()
+        new_content = (
+            content[:insert_at]
+            + "\n    <packaging>jar</packaging>"
+            + content[insert_at:]
+        )
+        return new_content, True
+
+    if "</version>" in content:
+        new_content = content.replace(
+            "</version>", "</version>\n    <packaging>jar</packaging>", 1
+        )
+        return new_content, True
+
+    return content, False
+
+
 def ensure_runnable_pom(project_root: Path) -> list[str]:
     """
     ENFORCES a runnable pom.xml instead of just warning:
@@ -111,8 +146,8 @@ def ensure_runnable_pom(project_root: Path) -> list[str]:
     content = pom.read_text(encoding="utf-8", errors="ignore")
     fixes: list[str] = []
 
-    if "<packaging>" not in content and "</version>" in content:
-        content = content.replace("</version>", "</version>\n    <packaging>jar</packaging>", 1)
+    content, packaging_injected = _inject_packaging(content)
+    if packaging_injected:
         fixes.append("Injected missing <packaging>jar</packaging>.")
 
     if not JAVA_VERSION_TAG_RE.search(content) and not JAVA_VERSION_PROPERTY_RE.search(content):

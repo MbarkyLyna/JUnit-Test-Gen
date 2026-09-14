@@ -26,6 +26,7 @@ from app.services.workspace import (
     clone_github_repo,
     create_session,
     extract_zip,
+    get_project_info,
 )
 
 router = APIRouter(prefix="/api")
@@ -49,6 +50,7 @@ def _build_upload_response(session_id: str, project_root: Path) -> UploadRespons
         tree=tree,
         stats=stats,
         project_root=str(project_root),
+        project_info=get_project_info(project_root),
     )
 
 
@@ -159,6 +161,7 @@ async def analyze_project(session_id: str) -> AnalyzeResponse:
         session_id=session_id,
         stats=stats,
         maven_output_tail=tail,
+        project_info=get_project_info(project_root),
     )
 
 
@@ -218,7 +221,14 @@ async def start_generate_job(
     elif body.scope == "project":
         from app.services import java_parser
 
-        job.total = len(java_parser.list_main_classes(project_root))
+        # NOTE: changed from list_main_classes() to list_generation_targets().
+        # test_generator.generate_tests_for_scope() was updated to actually
+        # SKIP Swing/AWT classes, package-info/module-info, and pure
+        # interfaces for scope="project" (see java_parser.py Step 3 changes).
+        # Leaving this as list_main_classes() would have inflated job.total
+        # with classes that never actually get processed, making the
+        # progress bar in the UI wrong (it would stall short of 100%).
+        job.total = len(java_parser.list_generation_targets(project_root))
     job.message = "Job queued"
 
     background_tasks.add_task(
